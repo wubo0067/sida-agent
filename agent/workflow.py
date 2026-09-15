@@ -27,6 +27,11 @@ from storage.graph_store import (
     ScienceGraphStore,
     node_key,
 )
+from storage.image_store import (
+    refs_from_examples,
+    refs_from_metadatas,
+    render_image_section,
+)
 
 log = get_logger()
 
@@ -442,17 +447,23 @@ def create_circuit_agent(
         log.debug("[workflow.search_problems] 讲义页搜题, subject=%s, text=%r",
                   subject, text[:80])
         problem_chunks: List[str] = []
+        problem_images: List[Any] = []   # 命中页的 (pdf_id, 页码)，供回答末尾配「教材原图」
         if not text or vector_db is None:
             log.info("[workflow.search_problems] 无有效检索文本，跳过")
-            return {"problem_chunks": []}
+            return {"problem_chunks": [], "problem_images": []}
         # filter 顶层多字段 AND 必须显式 $and，否则 Chroma 抛
         # "Expected where to have exactly one operator"（同 _gather_known_context）。
         where: dict = {"$and": [{"subject": subject}, {"type": "Page"}]}
         try:
             got = vector_db.get(where=where, where_document={"$contains": text})
             docs = (got or {}).get("documents") or []
+            metas = (got or {}).get("metadatas") or []
             if docs:
-                problem_chunks = [d for d in docs if d]
+                # documents 与 metadatas 按下标一一对应：先按「文档非空」配对再拆开，
+                # 避免单独过滤 docs 造成图片引用与页切片错位（配图张冠李戴）
+                pairs = [(d, m) for d, m in zip(docs, metas) if d]
+                problem_chunks = [d for d, _ in pairs]
+                problem_images = refs_from_metadatas(m for _, m in pairs)
                 log.info("[workflow.search_problems] 原文逐字命中讲义页 %d 页",
                          len(problem_chunks))
         except Exception:  # noqa: BLE001
@@ -469,12 +480,15 @@ def create_circuit_agent(
                 ((_bigram_overlap(text, doc.page_content), dist, doc)
                  for doc, dist in hits),
                 key=lambda x: (-x[0], x[1]))
-            problem_chunks = [doc.page_content for _, _, doc in
-                              ranked[:_SEARCH_PROBLEM_TOP_K] if doc.page_content]
+            top_docs = [doc for _, _, doc in ranked[:_SEARCH_PROBLEM_TOP_K]
+                        if doc.page_content]
+            problem_chunks = [doc.page_content for doc in top_docs]
+            problem_images = refs_from_metadatas(doc.metadata for doc in top_docs)
             log.info("[workflow.search_problems] 语义兜底重排后取 %d 页（候选 %d 页）",
                      len(problem_chunks), len(hits))
-        log.info("[workflow.search_problems] 命中讲义页 %d 页", len(problem_chunks))
-        return {"problem_chunks": problem_chunks}
+        log.info("[workflow.search_problems] 命中讲义页 %d 页（可配原图 %d 张）",
+                 len(problem_chunks), len(problem_images))
+        return {"problem_chunks": problem_chunks, "problem_images": problem_images}
 
     def generate_problem_response_node(state: CircuitAgentState):
         """搜题专用生成：从命中的整页讲义原文里定位目标题，原题呈现并简要讲解。"""
@@ -521,9 +535,15 @@ def create_circuit_agent(
         response = _stream_answer(answer_llm, final_prompt)
         log.info("[workflow.generate_problem_response] 搜题解答生成完成, 长度=%d 字符",
                  len(response))
+        # 教材原图：按命中页切片的 (pdf_id, 页码) 确定性追加到**回答末尾**，不让
+        # LLM 参与链接生成（模型写图片链接的可靠性很低，与公式定界符同理）。
+        image_section = render_image_section(state.get("problem_images") or [])
         # final_answer 供单轮 ask/all 复用（main 保存 md）；AIMessage 供
         # chat 模式把回答写回 messages 会话历史（由 checkpointer 持久化）。
-        return {"final_answer": response, "messages": [AIMessage(content=response)]}
+        # 原图区块只进 final_answer：它是给人看的输出产物，没必要回流进对话历史
+        #   白占 token（下一轮模型读到一段图片语法毫无意义）。
+        return {"final_answer": response + image_section,
+                "messages": [AIMessage(content=response)]}
 
     def generate_response_node(state: CircuitAgentState):
         g_ctx = state.get("graph_context", {})
@@ -733,9 +753,17 @@ def create_circuit_agent(
 """
         response = _stream_answer(answer_llm, final_prompt)
         log.info("[workflow.generate_response] 解答生成完成, 长度=%d 字符", len(response))
+        # 教材原图：按本轮命中例题的 (pdf_id, source.page) 确定性追加到回答末尾。
+        # 概念/公式/实验/题型/方法节点抽取时不记页码（见上方 pages_hit 处的注释），
+        # 故现阶段只有「回表到具体讲义页」的例题路径能配图；未落盘的图片会被
+        # render_image_section 自动过滤，因此不会产出死链。
+        image_section = render_image_section(
+            refs_from_examples(g_ctx.get("examples", [])))
         # final_answer 供单轮 ask/all 复用（main 保存 md）；AIMessage 供
         # chat 模式把回答写回 messages 会话历史（由 checkpointer 持久化）。
-        return {"final_answer": response, "messages": [AIMessage(content=response)]}
+        # 原图区块只进 final_answer，理由同 generate_problem_response_node。
+        return {"final_answer": response + image_section,
+                "messages": [AIMessage(content=response)]}
 
     def respond_chitchat_node(state: CircuitAgentState):
         """闲聊/与知识库无关话题的轻量直答：不触发图谱/向量检索。

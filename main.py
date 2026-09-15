@@ -68,6 +68,7 @@ from logger import get_logger
 from pdf_processor import (_load_cached_pages, _pdf_id,
                            extract_pdf_pages_as_markdown)
 from storage.graph_store import ScienceGraphStore
+from storage.image_store import relativize_image_paths
 from storage.vector_store import get_vector_store
 
 log = get_logger()
@@ -182,7 +183,10 @@ def _save_answer_markdown(result: dict, fallback_subject: str) -> Path:
         "", "## 提问", "", result.get("query", ""),
         "", "## 讲解", "", result.get("final_answer", ""), "",
     ]
-    path.write_text("\n".join(lines), encoding="utf-8")
+    # 回答里的「教材原图」路径以项目根为基准书写（见 storage/image_store），
+    # 这里按本文件实际位置换算成相对路径——Markdown 阅读器按 md 所在目录解析
+    # 相对路径，不换算就会在 output/answers/ 下断链。
+    path.write_text(relativize_image_paths("\n".join(lines), path), encoding="utf-8")
     return path
 
 

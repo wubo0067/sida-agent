@@ -12,6 +12,9 @@
   再由推理模型提炼成概念 / 公式 / 实验 / 题型 / 例题 / 方法等教研实体。
 - **答案能指到教材第几页**：例题正文不由模型抄写，而是在抽取时记下出处页码，
   问答时按页码回向量库取讲义原文，生成的讲解里标注「（见《教材名》第 X 页）」。
+- **还能直接把教材原图贴出来**：每页另按显示尺寸（长边 1600px PNG）存一张整页图，
+  回答末尾由**应用层**（而非模型）确定性追加「## 【教材原图】」区块——电路图 / 几何图 /
+  实验装置图不再只靠视觉模型的文字转写（见 **「3.13 教材原图旁路」**）。
 - **问公式名 / 集合名词也能命中**：提问的锚点未必是概念名——可能是公式名
   （「三角函数的倍角公式」）、也可能是一族实体的统称（「两角和公式」= 正弦/余弦/正切
   三条）。检索链路对锚点做「精确 → 模糊 → 同族展开」三级解析，把整族内容一次捞回，
@@ -56,9 +59,13 @@ flowchart TD
     GEN --> ANS[讲解 Markdown<br/>output/answers/]
     GENQ --> ANS
     CHITCHAT --> ANS
+    PDF -.->|①b 教材原图旁路<br/>纯本地渲染, 零模型成本| IMG[(整页 PNG<br/>output/pdf_images/)]
+    IMG -.->|存在性校验后拼到回答末尾| ANS
 ```
 
 - **阶段①（视觉）**：`pdf_processor.py`，PDF 页 → Markdown，逐页缓存。
+  同一步里另跑一条**教材原图旁路**（`storage/image_store.py`），把每页存成整页 PNG
+  供回答展示；它不参与缓存判定、不写页 Markdown，与版本号完全解耦（见 3.13）。
 - **阶段②（抽取入库）**：`ingestion.py`，Markdown → 双库，按子块增量、抽取结果缓存。
 - **阶段③（问答）**：`agent/workflow.py`（LangGraph），提问 → 检索 → 生成分层讲解。
   `--stage chat` 时额外经 `chat_session.py` 挂 SqliteSaver 做会话持久化。
@@ -70,8 +77,10 @@ flowchart TD
 ### 3.1 视觉提取与逐页缓存（`pdf_processor.py`）
 
 - `extract_pdf_pages_as_markdown(pdf_path, start_page, end_page, ...)`：用 PyMuPDF
-  把每页渲染成 PNG（仅内存，长边上限 `MAX_LONG_EDGE=3000`、放大倍数上限 `MAX_ZOOM=4.0`），
-  连同一段通用结构化提示词 `PROMPT` 交给视觉模型。
+  把每页渲染成 PNG（长边上限 `MAX_LONG_EDGE=3000`、放大倍数上限 `MAX_ZOOM=4.0`），
+  连同一段通用结构化提示词 `PROMPT` 交给视觉模型。这份 PNG **仅供模型这一次调用，不回写页
+  Markdown**——回答末尾要展示给用户的「教材原图」另有一条独立旁路，按显示尺寸单独落盘
+  （见 **「3.13 教材原图旁路」**）。
 - **缓存命名**：`output/pdf_extract/{pdf_id}/p{页码:04d}_{_EXTRACT_VERSION}.md`，
   当前 `_EXTRACT_VERSION="v2"`。`pdf_id = _pdf_id(pdf)` 是 **PDF 文件内容 SHA-256 的前 16 位**
   （与 `knowledge_extract/extract_pdf` 同算法，两项目可共用缓存目录）。
@@ -207,6 +216,11 @@ LangGraph 状态机（`create_circuit_agent` 编译），节点：
   整页逐字命中；无命中再语义检索取 top `_SEARCH_PROBLEM_RERANK_K=10` 候选，
   按 `_bigram_overlap`（相邻字符二元组重合度）重排后取 top `_SEARCH_PROBLEM_TOP_K=3`，
   由 `generate_problem_response` 在整页原文里定位目标题、原题呈现并简析。
+  命中页的 `(pdf_id, 页码)` 同时收集进 `problem_images`（元数据配对方式见 3.13）。
+- **教材原图**：`generate_response` / `generate_problem_response` 收尾时把
+  `render_image_section(...)` 拼到回答末尾（`## 【教材原图】` + 整页 PNG）。
+  这是**应用层确定性拼接**，不交给模型生成——同 `_fix_math` 折叠 LaTeX 定界符的理由一样，
+  让模型写字面语法不可靠。图片只进 `final_answer`，不进 `messages`，机制见 3.13。
 - **`respond_chitchat`（offtopic）**：不触发任何检索，一两句轻量回应并引导回学习。
 
 ### 3.8 实体锚点解析与集合名词同族展开（`storage/graph_store.py`）
@@ -424,6 +438,63 @@ main.py --stage chat
   可跳过空壳）、`merge_concepts`（把 alias 的入边 / 出边按原关系重指到 canonical，
   再按「越建越全」逐字段合并属性、删除 alias；canonical 不存在时整体改名）。
 
+### 3.13 教材原图旁路（`storage/image_store.py` + `pdf_processor`）
+
+**要解决的问题**：视觉提取时图片只被「读一次」——模型把图里的内容转写成文字后 PNG 就丢了。
+于是回答能引用「（见第 34 页）」，却永远拿不出那张图。典型的电路图 / 几何图 / 验电器装置图，
+文字转写必然丢信息。
+
+**做法**：从文本提取链路旁边**独立开一条旁路**，把每页按**显示尺寸**再渲染一份落盘，
+回答生成时由**应用层**（而非模型）把图片链接追加到回答末尾。
+
+- **落盘位置**：`output/pdf_images/{pdf_id}/p{页码:04d}.png`；`pdf_id` 与页缓存同算法
+  （PDF 内容 SHA-256 前 16 位），因此图片与页缓存天然一一对应。
+- **尺寸**：`DISPLAY_LONG_EDGE=1600`（长边缩放，PNG）。与喂给模型的
+  `MAX_LONG_EDGE=3000` 是两套独立参数：前者是**给人看**的显示图（可读性足够、体积可控），
+  后者是**给模型看**的输入，`_render_page(page, *, long_edge=...)` 由 `long_edge` 参数区分。
+  实测 A4 教材页约 `1131×1600`、`88~300 KB/页`。
+- **触发时机**：`extract_pdf_pages_as_markdown` 在**逐页提取循环之前**先扫一遍页码范围补图。
+  刻意放在循环之外，因为补图是**纯本地渲染、零模型成本**，不该受 `max_new_calls`
+  （约束视觉模型花费）影响——否则「已达上限 break」会让剩余页集体漏图。
+- **去重**：**仅以文件是否存在判定**（存在即跳过，实测二次调用耗时 0.0000s）。
+  没有清单文件、没有版本号。
+- **容错**：渲染 / 写盘任何异常只记 warning 并返回 `None`，**不阻断**文本提取主流程——
+  原图是可选增强，不该让一次渲染失败毁掉整轮断点续跑的成果。
+
+**两条硬约束（改动此模块前必读）**：
+
+1. **补图不得触碰任何版本号。** `pdf_processor._EXTRACT_VERSION` 与
+   `ingestion._EXTRACT_SCHEMA_VERSION` 的递增语义分别是「视觉页缓存整体失效」和
+   「整批抽取缓存失效」。补图与这两者无关，绝不能掺入它们的判定条件，否则整本书会被迫重跑。
+2. **图片路径不得写入页 Markdown。** 页 Markdown 是 `ingestion._cache_key(subject,
+   full_markdown)` 的哈希输入，正文改一个字符就让**全部**子块抽取缓存失效（代价是推理模型
+   整本重抽）。因此图片链接只在**回答落盘时**由应用层拼接，页缓存、抽取缓存全程不知情。
+
+**引用来源（`(pdf_id, 页码)` 从哪来）**：只有带页码的检索路径能挂图。
+
+- `search_problems` 路径：命中讲义页切片的 `metadata` 里直接有 `pdf_id` + `page`
+  （`refs_from_metadatas`）。`$contains` 逐字命中分支**必须把 `documents` 与 `metadatas`
+  按「文档非空」配对后再拆开**，否则两条平行列表错位会导致「答的是第 29 页、配的是第 34 页」。
+- `fetch_chunks` 回表路径：例题的 `source.page` 即页码，从 `examples` 收集
+  （`refs_from_examples`）。
+- 图谱上下文里的概念 / 公式 / 实验 / 题型 / 方法节点**不带页码**，因此目前挂不上图。
+
+**渲染与落盘**：
+
+- `render_image_section(refs)` 只保留**文件确实存在**的引用；一张都不存在时返回空串。
+  这条「先查文件再出链接」是**防死链**的关键——多本教材混用同一知识库时，未补图的
+  PDF 不会在图区留下坏链接。
+- 回答里的路径按**项目根**书写（`output/pdf_images/...`）；`relativize_image_paths(text,
+  out_path)` 在落盘时按目标 md 的实际目录换算（`output/answers/` → `../pdf_images/...`，
+  `output/chat/exports/` → `../../pdf_images/...`），跨盘符时回退 `Path.as_uri()`。
+  Markdown 阅读器按 md 自身目录解析相对路径，不换算就会断链。
+- 图片区块只写进 `final_answer`，**不写进 `messages`**——避免把一堆图片语法塞进对话历史，
+  污染后续轮次的上下文压缩。
+
+**成本与产物规模**：补图零 LLM 调用（实测 182 页 0.36s 完成、`[提取]` 计数 0）。
+已建库的教材需**重跑一次 `build`（可 `--max-new-calls 0` 保证零模型调用）**才会补图。
+体积参考：单本 240 页教材约 69 MB；多本累积到 GB 级属正常，需按需清理 `output/pdf_images/`。
+
 ---
 
 ## 4. 快速开始
@@ -491,6 +562,16 @@ uv run python main.py --stage chat --session s-xxxx # 续聊指定会话
 
 > `--pdf` 默认值 `L:/vivi/初三/物理/9S合并PDF-完整.pdf` 是开发机路径，换机器请显式传入自己的 PDF。
 
+**给已建库的教材补「教材原图」**（图片旁路是后加的，旧库没有图）：
+
+```powershell
+# --max-new-calls 0 保证零模型调用：页缓存命中 + 纯本地渲染补图
+uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完整.pdf" --start-page 5 --end-page 186 --subject physics --max-new-calls 0
+```
+
+日志出现 `教材原图：本次新落盘 N 张` 即完成；重复执行会打印 `本次新落盘 0 张`（存在即跳过）。
+图片落在 `output/pdf_images/{pdf_id}/`，回答里的附图路径由落盘时按目标目录自动换算。
+
 ---
 
 ## 5. 命令行参数表
@@ -535,17 +616,19 @@ sida-agent/
 │   └── workflow.py            # 阶段③：问答工作流（意图判定/图谱检索/回表/生成/搜题/闲聊/上下文压缩）
 ├── storage/
 │   ├── graph_store.py         # ScienceGraphStore：node_key 规则、增删边、get_subgraph/get_entity_subgraph/章节聚合、实体+同族模糊解析、度数族匹配、概念级下钻+相关性截断、合并、save/load
-│   └── vector_store.py        # get_vector_store：Chroma 持久化封装
+│   ├── vector_store.py        # get_vector_store：Chroma 持久化封装
+│   └── image_store.py         # 教材原图旁路：落盘/去重、引用归一化、图区渲染、路径重写（页缓存与抽取缓存全程不感知，见 3.13）
 ├── pyproject.toml             # 依赖与 Python 版本声明
 ├── uv.lock                    # 锁定依赖版本
 ├── .env                       # 模型服务配置（被 .gitignore 忽略，不入库）
 ├── .python-version            # uv 使用的 Python 版本（3.11）
 └── output/                    # 运行产物（被 .gitignore 忽略）
     ├── pdf_extract/{pdf_id}/p{页码}_v2.md   # 视觉逐页缓存
+    ├── pdf_images/{pdf_id}/p{页码:04d}.png  # 教材原图（长边 1600px，回答末尾展示用）
     ├── extract_cache/{key}.json             # 抽取结果缓存
     ├── vector_db/                           # Chroma 持久化向量库
     ├── knowledge_graph.json                 # 图谱 JSON 快照
-    ├── answers/answer_{时间}_{学科}.md       # 单轮问答讲解
+    ├── answers/answer_{时间}_{学科}.md       # 单轮问答讲解（图片路径已按本目录改写）
     ├── chat/checkpoints.sqlite              # chat 会话检查点
     ├── chat/exports/                        # chat 会话导出
     └── sida_agent.log                       # 全量 DEBUG 日志
@@ -590,6 +673,18 @@ sida-agent/
   是一次性迁移脚本，不是常规功能，换数据集不适用。
 - **多轮对话预算按「字符」粗估**（`_CHAT_HISTORY_BUDGET_CHARS=12000`），非 token 口径，
   中英混排下与实际上下文窗口占用会有偏差。
+- **教材原图是整页扫描、不裁剪**（见 3.13）：一页常含多道题与手写批注，回答末尾附图
+  占篇幅较大，用户需自己找题。裁剪到「单张图 / 单道题」未实现。
+- **只有带页码的两条链路能挂图**：`search_problems`（讲义页切片）与 `fetch_chunks`
+  （例题回表）。图谱上下文里的概念 / 公式 / 实验 / 题型 / 方法节点**不带页码**，
+  所以「概念讲解类」提问（如问某实验装置）目前在回答里看不到图——这属于待扩展项，
+  需给实体抽取增加页码字段（会使抽取缓存整体失效，代价为推理模型重抽）。
+- **未补图的 PDF 会静默无图**：`render_image_section` 只输出**文件确实存在**的页，
+  旧教材没重跑 `build` 时答案是干净的、不留死链，但也不会有图，且日志不报错（设计如此）。
+- **图区无数量上限**：`$contains` 逐字命中可能一次命中十几页（实测「验电器」命中 13 页），
+  回答末尾会连续挂十几张整页图。当前未做「按相关度取前 N 张」截断。
+- **图片体积可观**：长边 1600px PNG 实测约 `88~300 KB/页`，单本 240 页约 69 MB；
+  多本累积到 GB 级属正常，需按需清理 `output/pdf_images/`。
 
 ### 待确认清单（代码无法判断业务原因，不下结论）
 
