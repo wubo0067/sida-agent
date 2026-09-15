@@ -17,6 +17,11 @@
 - methods          通法技巧
 - extra_relations  补充关系
 
+知识实体（概念/公式/实验/题型/方法）还可带 source_pages：该实体在讲义中出现的
+页码。入库时与 pdf_id 组合成 ``page_refs``=["{pdf_id}:{页码}", ...] 落到节点上，
+供问答链路按页码旁路拼「教材原图」（见 storage/image_store）；例题不用该字段，
+其出处已由 source.page 表达。
+
 入库策略：
 1. 图库（ScienceGraphStore）：实体为节点（subject:Kind:name 学科命名空间隔离），
    依据 prerequisites / related_concepts / question_type 字段自动建边，
@@ -40,7 +45,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -164,8 +169,10 @@ def _repair_json_escapes(text: str) -> str:
 
 # 抽取 schema 版本：prompt/结构变更时递增，用于失效旧缓存
 # v3：增量建库（自动分块 + 已建章节/概念滚动上下文注入 + 跨块题型回退挂边）
+# v4：知识实体新增 source_pages（该实体出现的讲义页码），落在节点 page_refs 上，
+#     供回答末尾旁路拼「教材原图」——概念/公式/实验路径此前无页码，配不了图。
 # 语义变化使旧版整批抽取缓存不再适用，故递增使旧缓存整体失效。
-_EXTRACT_SCHEMA_VERSION = "v3"
+_EXTRACT_SCHEMA_VERSION = "v4"
 # 抽取结果缓存目录（按输入哈希落盘，相同输入二次构建直接跳过 LLM）
 _CACHE_DIR = Path(__file__).resolve().parent / "output" / "extract_cache"
 
@@ -312,6 +319,49 @@ def _as_list(value: Any, label: str, field: str, stringify: bool = True) -> List
     return []
 
 
+# source_pages 合法页码区间：下界挡住 0/负数（讲义页码从 1 起），上界兜住 LLM
+# 偶发的天文数字（把公式里的系数、年份误当页码），防脏数据落进图谱。
+_PAGE_MIN, _PAGE_MAX = 1, 20000
+
+
+def _as_pages(value: Any, label: str) -> List[int]:
+    """把抽取出的页码字段归一化为「升序去重」的合法页码列表（非法项丢弃并告警）。
+
+    LLM 实测会写成 34、["34", "35"]、"P34"、"34-36"、[34.0] 等多种形态，故统一
+    抠出其中的整数。页码是回定位教材原图的键，写错会直接挂出无关页面的图片，
+    因此只接受能解析为整数的项，其余明确丢弃并 warning，不做静默兜底
+    （静默通过会让「图挂错页」这类问题无迹可查）。
+    """
+    if value is None:
+        return []
+    items: List[Any] = list(value) if isinstance(value, (list, tuple, set)) else [value]
+    nums: List[int] = []
+    dropped: List[str] = []
+    for v in items:
+        if isinstance(v, bool):
+            dropped.append(repr(v))
+            continue
+        found: List[int] = []
+        if isinstance(v, int):
+            found.append(v)
+        elif isinstance(v, float) and v.is_integer():
+            found.append(int(v))
+        elif isinstance(v, str):
+            found = [int(t) for t in re.findall(r"\d+", v)]
+        if not found:
+            dropped.append(repr(v))
+            continue
+        for n in found:
+            if not _PAGE_MIN <= n <= _PAGE_MAX:
+                dropped.append(repr(v))
+            elif n not in nums:
+                nums.append(n)
+    if dropped:
+        log.warning("[ingestion] %s 的 source_pages 丢弃 %d 个非法页码: %s",
+                    label, len(dropped), ", ".join(dropped[:8]))
+    return sorted(nums)
+
+
 def _normalize_extracted(data: Dict[str, Any]) -> None:
     """就地归一化抽取结果（含旧缓存脏数据）：实体须为对象、字符串字段 str 化、
     数组字段校验类型。
@@ -450,19 +500,23 @@ def _build_knowledge_prompt(subject: str, markdown: str,
   "chapters": [{{"title": "章节标题", "summary": "本章概要"}}],
   "concepts": [
     {{"name": "概念名", "description": "一句话精确定义", "breakdown": ["拆解要点1", "拆解要点2"],
-      "common_mistakes": ["易错点"], "prerequisites": ["先修概念名"], "chapter": "所属章节标题"}}
+      "common_mistakes": ["易错点"], "prerequisites": ["先修概念名"], "chapter": "所属章节标题",
+      "source_pages": [12, 13]}}
   ],
   "formulas": [
     {{"name": "公式/定理名", "expression": "$I=U/R$", "symbols": [{{"symbol": "I", "meaning": "含义", "unit": "单位"}}],
-      "applicable_scope": "适用条件", "derivation": ["推导/变形步骤"], "related_concepts": ["关联概念名"]}}
+      "applicable_scope": "适用条件", "derivation": ["推导/变形步骤"], "related_concepts": ["关联概念名"],
+      "source_pages": [18]}}
   ],
   "experiments": [
     {{"name": "实验名", "purpose": "实验目的", "apparatus": ["器材1"], "steps": ["步骤1"],
       "phenomenon": "现象", "conclusion": "结论", "diagram": "装置/电路连接的文字图解描述",
-      "exam_focus": ["常考考点"], "related_concepts": ["关联概念名"]}}
+      "exam_focus": ["常考考点"], "related_concepts": ["关联概念名"],
+      "source_pages": [21, 22]}}
   ],
   "methods": [
-    {{"name": "方法名", "scope": "适用场景", "steps": ["步骤"], "related_concepts": ["关联概念名"]}}
+    {{"name": "方法名", "scope": "适用场景", "steps": ["步骤"], "related_concepts": ["关联概念名"],
+      "source_pages": [30]}}
   ]
 }}
 
@@ -475,6 +529,9 @@ def _build_knowledge_prompt(subject: str, markdown: str,
 5. 若本批实体与【已建库/全书已有章节】列表中的名称指同一概念或同一章节，
    name/title 必须逐字复用，不得另起同义名；复用不等于补写，只抽取本批
    文本里实际出现的内容。
+6. source_pages 填该实体在本文本中出现的页码（即正文 "--- 第 N 页 ---" 标记
+   里的 N），用于回定位教材原图，务必逐页核对准确；只填本文本里真实出现过的
+   页码，不要推算、不要填本文本以外的页码。确实没有页码依据时填 []。
 """
 
 
@@ -504,7 +561,7 @@ def _build_question_prompt(subject: str, markdown: str, concept_names: List[str]
 {{
   "question_types": [
     {{"name": "题型名", "identify_features": ["题干识别特征"], "template": ["解题模板步骤"],
-      "traps": ["常见陷阱"], "related_concepts": ["考点概念名"]}}
+      "traps": ["常见陷阱"], "related_concepts": ["考点概念名"], "source_pages": [34]}}
   ],
   "examples": [
     {{"id": "原题编号如 例17", "title": "小标题",
@@ -525,6 +582,9 @@ def _build_question_prompt(subject: str, markdown: str, concept_names: List[str]
    或【已建库的相关概念】，不得填公式/实验/题型/方法名。
 5. 归属题型若是此前子块已建的题型（本批未重复声明），question_type 填其原题型名，
    不要因为不在本批就填空串。
+6. question_types 的 source_pages 填该题型在本文本中出现的页码（即正文
+   "--- 第 N 页 ---" 标记里的 N），供回定位教材原图；只填本文本里真实出现过的
+   页码，没有页码依据时填 []。
 """
 
 
@@ -598,17 +658,43 @@ def _resolve_ref_key(graph_db: ScienceGraphStore, subject: str,
 
 
 def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any], *,
-                 pdf_id: Optional[str] = None) -> None:
+                 pdf_id: Optional[str] = None,
+                 pages: Optional[Set[int]] = None) -> None:
     """把抽取出的实体与关系写入图库（核心编排逻辑）。
 
     pdf_id：PDF 内容哈希前 16 位。用途：
     - 各类知识实体（章节/概念/公式/实验/题型/方法）的 sources 属性累积
       （多本教材共同收录 = 更值得重点讲的核心考点信号，问答标注时反查教材名）；
-    - 例题节点键前缀（不同书的「例17」是不同题目，须隔离，否则同名互相锁死）。
+    - 例题节点键前缀（不同书的「例17」是不同题目，须隔离，否则同名互相锁死）；
+    - 实体 page_refs 的前缀（见 _page_refs_of，页码必须与教材绑定）。
     概念/公式/实验/题型/方法等知识实体同名=真同一知识点，不做来源隔离，
     靠 _ensure_entity 的越建越全合并累积两本书的内容。
+
+    pages：本子块实际包含的讲义页码集合。抽取模型只看到本子块文本，source_pages
+    落在集合之外的一律是幻觉（把公式系数/年份当页码），入库前必须剔除，否则回答
+    末尾会挂出与提问无关的教材页面。缺省（None）表示调用方无页码依据、不做校验。
     """
     src_list = [pdf_id] if pdf_id else None
+    block_pages: Optional[Set[int]] = set(pages) if pages else None
+
+    def _page_refs_of(item: Dict[str, Any], label: str) -> List[str]:
+        """把实体的 source_pages 转成「pdf_id:页码」复合引用（跨教材不串页）。
+
+        落库形态是复合字符串列表而非 ``{pdf_id: [页码]}`` 字典：_ensure_entity 的
+        dict 合并只补旧值里缺失的键、不会并集内层列表，同一实体跨子块出现时后一
+        子块的页码会被整段丢弃；而列表走 union 合并，天然累积页码。
+        """
+        nums = _as_pages(item.get("source_pages"), label)
+        if block_pages is not None:
+            outside = sorted(set(nums) - block_pages)
+            if outside:
+                log.warning("[ingestion] %s 的 source_pages 含本子块之外的页码，已剔除: %s"
+                            "（本块页码 %d-%d）", label, outside,
+                            min(block_pages), max(block_pages))
+            nums = [p for p in nums if p in block_pages]
+        if not pdf_id or not nums:
+            return []
+        return [f"{pdf_id}:{p}" for p in nums]
     # --- 章节 ---
     # 章节同样走 _ensure_entity 而非 add_entity：分块只在标题页之间切，不保证单章
     # 不超过 max_chars，长章节跨子块是常态；后续子块经滚动上下文会"逐字复用"同一
@@ -633,7 +719,8 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
             description=c.get("description", ""),
             breakdown=list(c.get("breakdown", [])),
             common_mistakes=list(c.get("common_mistakes", [])),
-            chapter=c.get("chapter", ""))
+            chapter=c.get("chapter", ""),
+            page_refs=_page_refs_of(c, f"概念 {name}"))
         if src_list:
             # 收录来源：同名概念跨 PDF 累积时 union 合并（先建者的 sources 不清空）
             c_attrs["sources"] = list(src_list)
@@ -703,6 +790,7 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              symbols=list(f.get("symbols", [])),
                              applicable_scope=f.get("applicable_scope", ""),
                              derivation=list(f.get("derivation", [])),
+                             page_refs=_page_refs_of(f, f"公式 {name}"),
                              **({"sources": list(src_list)} if src_list else {}))
         _link_concept_refs(f.get("related_concepts"), REL_HAS_FORMULA, key,
                            concept_names)
@@ -719,6 +807,7 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              conclusion=e.get("conclusion", ""),
                              diagram=e.get("diagram", ""),
                              exam_focus=list(e.get("exam_focus", [])),
+                             page_refs=_page_refs_of(e, f"实验 {name}"),
                              **({"sources": list(src_list)} if src_list else {}))
         _link_concept_refs(e.get("related_concepts"), REL_HAS_EXPERIMENT, key,
                            concept_names)
@@ -730,6 +819,7 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
         key = _ensure_entity(graph_db, subject, K_METHOD, name,
                              scope=m.get("scope", ""),
                              steps=list(m.get("steps", [])),
+                             page_refs=_page_refs_of(m, f"方法 {name}"),
                              **({"sources": list(src_list)} if src_list else {}))
         _link_concept_refs(m.get("related_concepts"), REL_HAS_METHOD, key,
                            concept_names)
@@ -744,6 +834,7 @@ def _write_graph(graph_db: ScienceGraphStore, subject: str, data: Dict[str, Any]
                              identify_features=list(qt.get("identify_features", [])),
                              template=list(qt.get("template", [])),
                              traps=list(qt.get("traps", [])),
+                             page_refs=_page_refs_of(qt, f"题型 {name}"),
                              **({"sources": list(src_list)} if src_list else {}))
         qt_keys[name] = key
         _link_concept_refs(qt.get("related_concepts"), REL_TRACES_TO, key,
@@ -1065,8 +1156,9 @@ def _persist_chunk(chunk: List[Dict[str, Any]], subject: str,
     log.info("[ingestion] JSON 抽取成功: %s",
              ", ".join(f"{k}={v}" for k, v in n_kind.items()))
 
-    # 1. 写入 Graph DB
-    _write_graph(graph_db, subject, data, pdf_id=pdf_id)
+    # 1. 写入 Graph DB（同时传入本块页码范围：source_pages 越界即幻觉，入库前拦截）
+    _write_graph(graph_db, subject, data, pdf_id=pdf_id,
+                 pages={int(p["page"]) for p in chunk if p.get("page") is not None})
 
     # 2. 写入 Vector DB（实体切片 + 本块讲义页切片，按 metadata["id"] 幂等 upsert）
     docs = (_build_vector_docs(subject, data, pdf_id=pdf_id)

@@ -28,7 +28,7 @@ from storage.graph_store import (
     node_key,
 )
 from storage.image_store import (
-    refs_from_examples,
+    refs_from_graph_context,
     refs_from_metadatas,
     render_image_section,
 )
@@ -664,7 +664,8 @@ def create_circuit_agent(
 
         examples_text = "\n\n".join(_tag_chunk(c) for c in chunks)
         # 讲义页切片自带「--- 第 N 页 ---」头，据此列出命中页码供模型标注来源；
-        # 图谱实体（公式/实验/题型/方法）抽取时不记页码，只能标注到「知识图谱」粒度。
+        # 图谱实体（公式/实验/题型/方法）命中时没有切片、页码另在节点的 page_refs 上
+        # （见 _persist_chunk → image_store.refs_from_graph_context），故此处只报讲义页。
         pages_hit = sorted({int(n) for c in chunks for n in re.findall(r"--- 第 (\d+) 页 ---", c)})
         if pages_hit:
             uniq_books = {page_books[p][0] for p in pages_hit
@@ -753,12 +754,12 @@ def create_circuit_agent(
 """
         response = _stream_answer(answer_llm, final_prompt)
         log.info("[workflow.generate_response] 解答生成完成, 长度=%d 字符", len(response))
-        # 教材原图：按本轮命中例题的 (pdf_id, source.page) 确定性追加到回答末尾。
-        # 概念/公式/实验/题型/方法节点抽取时不记页码（见上方 pages_hit 处的注释），
-        # 故现阶段只有「回表到具体讲义页」的例题路径能配图；未落盘的图片会被
-        # render_image_section 自动过滤，因此不会产出死链。
-        image_section = render_image_section(
-            refs_from_examples(g_ctx.get("examples", [])))
+        # 教材原图：按本轮命中的 (pdf_id, 页码) 确定性追加到回答末尾。页码有两路来源，
+        # 由 refs_from_graph_context 一并汇总并按优先级占用配额（例题页优先，其次锚点概念、
+        # 实验、公式、题型/方法，最后相邻概念）：搜题路径取命中页切片的出处，概念/公式/实验
+        # 讲解路径取图谱节点的 page_refs（见 ingestion._write_graph → 节点属性）。未落盘的
+        # 图片被 render_image_section 过滤，故未补图的教材不产死链、也不占配额。
+        image_section = render_image_section(refs_from_graph_context(g_ctx))
         # final_answer 供单轮 ask/all 复用（main 保存 md）；AIMessage 供
         # chat 模式把回答写回 messages 会话历史（由 checkpointer 持久化）。
         # 原图区块只进 final_answer，理由同 generate_problem_response_node。

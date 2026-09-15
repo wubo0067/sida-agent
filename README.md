@@ -14,7 +14,9 @@
   问答时按页码回向量库取讲义原文，生成的讲解里标注「（见《教材名》第 X 页）」。
 - **还能直接把教材原图贴出来**：每页另按显示尺寸（长边 1600px PNG）存一张整页图，
   回答末尾由**应用层**（而非模型）确定性追加「## 【教材原图】」区块——电路图 / 几何图 /
-  实验装置图不再只靠视觉模型的文字转写（见 **「3.13 教材原图旁路」**）。
+  实验装置图不再只靠视觉模型的文字转写。页码来源有两条：**搜题链路**取命中讲义页切片，
+  **讲解链路**（概念 / 公式 / 实验 / 题型 / 方法）取抽取时记录在节点 `page_refs` 上的页码
+  （见 **「3.13 教材原图旁路」**）。
 - **问公式名 / 集合名词也能命中**：提问的锚点未必是概念名——可能是公式名
   （「三角函数的倍角公式」）、也可能是一族实体的统称（「两角和公式」= 正弦/余弦/正切
   三条）。检索链路对锚点做「精确 → 模糊 → 同族展开」三级解析，把整族内容一次捞回，
@@ -43,7 +45,7 @@ flowchart TD
     MD -->|缓存 output/pdf_extract/pdf_id/p页码_v2.md| MD
     MD -->|② ingestion.build_knowledge_bases| EXTRACT[两批串行抽取 + 滚动上下文]
     EXTRACT -->|缓存 output/extract_cache/key.json| EXTRACT
-    EXTRACT --> GRAPH[(知识图谱 ScienceGraphStore<br/>output/knowledge_graph.json)]
+    EXTRACT -->|实体 source_pages → 节点 page_refs| GRAPH[(知识图谱 ScienceGraphStore<br/>output/knowledge_graph.json)]
     EXTRACT --> VECTOR[(向量库 Chroma<br/>output/vector_db)]
 
     Q[学生提问] -->|③ agent.workflow.create_circuit_agent| INTENT[analyze_intent<br/>判定学科+意图+锚点]
@@ -59,14 +61,16 @@ flowchart TD
     GEN --> ANS[讲解 Markdown<br/>output/answers/]
     GENQ --> ANS
     CHITCHAT --> ANS
+    GRAPH -.->|refs_from_graph_context<br/>概念/公式/实验/题型页码| GEN
+    IMG -.->|存在性校验 + 上限截断后拼到回答末尾| ANS
     PDF -.->|①b 教材原图旁路<br/>纯本地渲染, 零模型成本| IMG[(整页 PNG<br/>output/pdf_images/)]
-    IMG -.->|存在性校验后拼到回答末尾| ANS
 ```
 
 - **阶段①（视觉）**：`pdf_processor.py`，PDF 页 → Markdown，逐页缓存。
   同一步里另跑一条**教材原图旁路**（`storage/image_store.py`），把每页存成整页 PNG
   供回答展示；它不参与缓存判定、不写页 Markdown，与版本号完全解耦（见 3.13）。
-- **阶段②（抽取入库）**：`ingestion.py`，Markdown → 双库，按子块增量、抽取结果缓存。
+- **阶段②（抽取入库）**：`ingestion.py`，Markdown → 双库，按子块增量、抽取结果缓存；
+  同时把每个实体出现的页码（`source_pages` → 节点 `page_refs`）一并入图，供问答末端配图。
 - **阶段③（问答）**：`agent/workflow.py`（LangGraph），提问 → 检索 → 生成分层讲解。
   `--stage chat` 时额外经 `chat_session.py` 挂 SqliteSaver 做会话持久化。
 
@@ -107,6 +111,9 @@ flowchart TD
 
 - 每个子块做**两批** LLM 抽取：`_build_knowledge_prompt`（章节 / 概念 / 公式 / 实验 / 方法）
   → `_build_question_prompt`（题型 / 例题 / 补充关系，并注入第一批的概念名保证引用一致）。
+- 概念 / 公式 / 实验 / 题型 / 方法都要输出 **`source_pages`**（该实体在本文本中出现的页码，
+  即正文 `--- 第 N 页 ---` 标记里的 N），提示词明确要求「只填本文本里真实出现过的页码，
+  不要推算」。这是**教材原图旁路**在讲解类提问下的页码来源（见 3.13）。
 - 推理模型经 `get_reasoning_llm(enable_thinking=False)` 创建（追求吞吐，关思考模式）。
 - **滚动上下文**（`_gather_known_context`）：处理子块前注入两块信息，让模型「记得」此前建过什么，
   解决跨子块命名不一致 / 章节重复开章：
@@ -120,7 +127,13 @@ flowchart TD
 
 - **缓存 key**：`_cache_key(subject, full_markdown)` =
   `sha256(f"{subject}|{_EXTRACT_SCHEMA_VERSION}|{full_markdown}")[:16]`，当前
-  `_EXTRACT_SCHEMA_VERSION="v3"`。缓存文件 `output/extract_cache/{key}.json`。
+  `_EXTRACT_SCHEMA_VERSION="v4"`。缓存文件 `output/extract_cache/{key}.json`。
+  - **v4（当前）**：知识实体新增 `source_pages` 字段 → 落在节点 `page_refs` 上，供回答末尾
+    旁路拼「教材原图」——此前只有「回表到具体讲义页」的例题路径配得上图，概念/公式/实验
+    路径无页码依据。
+  - 代价：**抽取层缓存整体失效**（`output/extract_cache/` 需重建，推理 LLM 按子块重抽）。
+    但**视觉页缓存 `output/pdf_extract/` 不受影响**（那是 `pdf_processor._EXTRACT_VERSION`
+    的语义），这正是把图片旁路做在前面、与抽取 schema 解耦的价值。
 - key **只由该子块自身内容决定**，所以重跑同一条命令时已处理子块直接命中缓存、0 次 LLM 调用。
   `_persist_chunk` 每处理完一个子块就 `graph_db.save()` 一次——中途崩溃只丢当前子块，
   已处理子块均已持久化 + 缓存，配合上条即**天然断点续跑**。
@@ -141,7 +154,7 @@ flowchart TD
 |---|---|---|
 | 旧值缺失 / 为空（`None`/`""`/`[]`/`{}`） | 补上新值 | 修掉空壳节点永不更新 |
 | 本次传入为空值 | 保留旧值不动 | 空抽取不冲刷已收录内容 |
-| 无序列表（`breakdown`/`common_mistakes`/`sources`/`related_concepts`…） | union 去重保序 | 要点集合可累加 |
+| 无序列表（`breakdown`/`common_mistakes`/`sources`/`related_concepts`/`page_refs`…） | union 去重保序 | 要点集合可累加；`page_refs` 靠此跨子块累积页码 |
 | **顺序敏感字段**（`_SEQUENCE_FIELDS` = `derivation`/`template`/`steps`） | 保留更长的一份 | 两套步骤 union 会串成乱序流程 |
 | 标量字符串 | 保留更长的一份 | 更详细的表述优先 |
 | dict 字段（例题 `source`） | 只补缺失 / 为空的键，已有键先到先得、不覆盖 | 锁定首次抽取的真实 `page`，防「新标题配旧页码」缝合怪 |
@@ -156,6 +169,12 @@ flowchart TD
 概念 / 公式 / 实验 / 题型 / 方法等知识实体**同名即同一知识点，不做来源隔离**，
 靠上表合并累积；`sources` 属性累积 `pdf_id` 列表，作为「多本教材共收 = 核心考点」信号，
 问答时反查 `PdfSource` 注册表把「图谱收录」升级为「收录于《教材名》」。
+
+**`page_refs` 为什么是 `["{pdf_id}:{页码}", ...]` 而不是 `{pdf_id: [页码]}`**：
+同名实体跨子块出现时若用 dict，合并只补旧值里缺失的键、**不并集内层列表**，后一子块的页码
+会被整段丢弃；用扁平列表才走 union 分支、逐块累积。同理它也**不在** `_SEQUENCE_FIELDS` 里
+（那里「保留更长者」同样会丢掉先前的页码）。落库形态由 `_write_graph._page_refs_of` 生成，
+并用**本子块真实页码集合**过滤越界值（防模型把公式系数/年份当页码）。
 
 ### 3.6 审计 / 异常检测（`ingestion._audit_graph`）
 
@@ -221,6 +240,9 @@ LangGraph 状态机（`create_circuit_agent` 编译），节点：
   `render_image_section(...)` 拼到回答末尾（`## 【教材原图】` + 整页 PNG）。
   这是**应用层确定性拼接**，不交给模型生成——同 `_fix_math` 折叠 LaTeX 定界符的理由一样，
   让模型写字面语法不可靠。图片只进 `final_answer`，不进 `messages`，机制见 3.13。
+  concept 链路用 `refs_from_graph_context(g_ctx)` 汇总（例题页 + 各实体节点的
+  `page_refs`，按优先级取前 `MAX_IMAGES_PER_ANSWER=6` 张），find_problem 链路用本轮
+  `problem_images`（元数据比对方式见 3.13）。
 - **`respond_chitchat`（offtopic）**：不触发任何检索，一两句轻量回应并引导回学习。
 
 ### 3.8 实体锚点解析与集合名词同族展开（`storage/graph_store.py`）
@@ -438,7 +460,7 @@ main.py --stage chat
   可跳过空壳）、`merge_concepts`（把 alias 的入边 / 出边按原关系重指到 canonical，
   再按「越建越全」逐字段合并属性、删除 alias；canonical 不存在时整体改名）。
 
-### 3.13 教材原图旁路（`storage/image_store.py` + `pdf_processor`）
+### 3.13 教材原图旁路（`storage/image_store.py` + `pdf_processor` + `ingestion` + `agent/workflow`）
 
 **要解决的问题**：视觉提取时图片只被「读一次」——模型把图里的内容转写成文字后 PNG 就丢了。
 于是回答能引用「（见第 34 页）」，却永远拿不出那张图。典型的电路图 / 几何图 / 验电器装置图，
@@ -463,26 +485,49 @@ main.py --stage chat
 
 **两条硬约束（改动此模块前必读）**：
 
-1. **补图不得触碰任何版本号。** `pdf_processor._EXTRACT_VERSION` 与
+1. **补图本身不得触碰任何版本号。** `pdf_processor._EXTRACT_VERSION` 与
    `ingestion._EXTRACT_SCHEMA_VERSION` 的递增语义分别是「视觉页缓存整体失效」和
    「整批抽取缓存失效」。补图与这两者无关，绝不能掺入它们的判定条件，否则整本书会被迫重跑。
+   注意区分两种「动版本号」的情形：**纯旁路变更**（改排版、改路径规则、改去重口径）不得动
+   版本号；**抽取 schema 变更**（如给实体新增 `source_pages` 字段，见 3.4 的 v4 说明）**必须**
+   递增抽取版本号，否则旧缓存缺字段、功能静默失效——此时只需重建抽取层，**页/视觉缓存不受
+   影响**（这正是把图片旁路做在前面的价值）。
 2. **图片路径不得写入页 Markdown。** 页 Markdown 是 `ingestion._cache_key(subject,
    full_markdown)` 的哈希输入，正文改一个字符就让**全部**子块抽取缓存失效（代价是推理模型
    整本重抽）。因此图片链接只在**回答落盘时**由应用层拼接，页缓存、抽取缓存全程不知情。
 
-**引用来源（`(pdf_id, 页码)` 从哪来）**：只有带页码的检索路径能挂图。
+**引用来源（`(pdf_id, 页码)` 从哪来）**：两类提问各有一条页码来源，合起来覆盖「搜题」与
+「讲解」两种问法。
 
 - `search_problems` 路径：命中讲义页切片的 `metadata` 里直接有 `pdf_id` + `page`
   （`refs_from_metadatas`）。`$contains` 逐字命中分支**必须把 `documents` 与 `metadatas`
   按「文档非空」配对后再拆开**，否则两条平行列表错位会导致「答的是第 29 页、配的是第 34 页」。
 - `fetch_chunks` 回表路径：例题的 `source.page` 即页码，从 `examples` 收集
   （`refs_from_examples`）。
-- 图谱上下文里的概念 / 公式 / 实验 / 题型 / 方法节点**不带页码**，因此目前挂不上图。
+- **概念 / 公式 / 实验 / 题型 / 方法路径**（纯讲解类提问，如「验电器的原理是什么」）没有
+  页切片可回表，页码由抽取阶段写进节点：每个实体抽取时输出 `source_pages`（该实体出现的
+  讲义页码），`ingestion._write_graph` 把它与 `pdf_id` 拼成 `"{pdf_id}:{页码}"` 复合串列表
+  存到节点 `page_refs`，检索侧由 `graph_store` 原样下发、`refs_from_entities` 解析
+  （`refs_from_graph_context` 汇总全部来源）。
+
+**为什么 `page_refs` 是复合串列表而不是 `{pdf_id: [页码]}` 字典**：`_ensure_entity` 合并时，
+列表走**并集**、字典只补旧值里缺失的键、**不并集内层列表**——同一实体跨子块出现时，后一
+子块的页码会被整段丢弃。用列表才能让页码跨子块累积。同一理由，`page_refs` 也**不能**放进
+`_SEQUENCE_FIELDS`（那里是「保留更长者」，同样会丢掉先前子块累积的页码）。
+
+**优先级与数量上限**：`refs_from_graph_context` 按「例题页 > 锚点概念 > 实验 > 公式 >
+题型/方法 > 相邻概念」的顺序汇总，顺序即优先级；`MAX_IMAGES_PER_ANSWER=6` 截断。上限是
+必需的——一个枢纽概念可聚合出几十条公式/实验/题型，不限量会挂出几十张整页图。截断发生在
+「文件确实存在」过滤**之后**，所以未补图的教材不会白占配额；被放弃的页码记 info 日志。
+
+**幻觉拦截**：`source_pages` 是新增字段，模型可能把公式系数/年份当页码填。`_persist_chunk`
+把**本子块真实页码集合**传给 `_write_graph`，落在集合之外的页码一律剔除并记 warning，
+避免回答末尾挂出与提问无关的教材页。
 
 **渲染与落盘**：
 
-- `render_image_section(refs)` 只保留**文件确实存在**的引用；一张都不存在时返回空串。
-  这条「先查文件再出链接」是**防死链**的关键——多本教材混用同一知识库时，未补图的
+- `render_image_section(refs, limit=...)` 只保留**文件确实存在**的引用；一张都不存在时返回
+  空串。这条「先查文件再出链接」是**防死链**的关键——多本教材混用同一知识库时，未补图的
   PDF 不会在图区留下坏链接。
 - 回答里的路径按**项目根**书写（`output/pdf_images/...`）；`relativize_image_paths(text,
   out_path)` 在落盘时按目标 md 的实际目录换算（`output/answers/` → `../pdf_images/...`，
@@ -565,12 +610,33 @@ uv run python main.py --stage chat --session s-xxxx # 续聊指定会话
 **给已建库的教材补「教材原图」**（图片旁路是后加的，旧库没有图）：
 
 ```powershell
-# --max-new-calls 0 保证零模型调用：页缓存命中 + 纯本地渲染补图
-uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完整.pdf" --start-page 5 --end-page 186 --subject physics --max-new-calls 0
+# --max-new-calls 0 --max-chunks 0 双重保证零模型调用：
+#   视觉侧页缓存命中 + 抽取侧不处理任何新子块，只跑纯本地渲染补图
+uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完整.pdf" --start-page 5 --end-page 186 --subject physics --max-new-calls 0 --max-chunks 0 --yes
 ```
 
 日志出现 `教材原图：本次新落盘 N 张` 即完成；重复执行会打印 `本次新落盘 0 张`（存在即跳过）。
 图片落在 `output/pdf_images/{pdf_id}/`，回答里的附图路径由落盘时按目标目录自动换算。
+
+> 这两个 `0` 都是必需的：仅 `--max-new-calls 0` 只挡住视觉模型，抽取侧在 v4 缓存未建立时
+> 仍会调用推理模型（**注意这条在 v4 之前是不同的**——当时抽取缓存命中，单靠它即可零调用）。
+
+**重建抽取层，让「讲解类提问」也能配图**（`_EXTRACT_SCHEMA_VERSION` v3 → v4）：
+
+```powershell
+# 放开 --max-chunks，按子块重抽（每子块 2 次推理调用）；视觉页缓存不受影响
+uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完整.pdf" --start-page 5 --end-page 186 --subject physics --max-new-calls 0 --yes
+```
+
+- **为什么必须重抽**：旧缓存里没有 `source_pages` 字段，节点也就没有 `page_refs`，
+  概念 / 公式 / 实验 / 题型 / 方法路径一律配不上图。
+- **代价可控**：只失效 `output/extract_cache/`（推理 LLM 重抽），
+  `output/pdf_extract/` 的逐页视觉缓存照旧命中（实测命令输出
+  `视觉提取：无实际模型调用（全部命中缓存）`）。
+- **可分批**：`--max-chunks N` 限本轮处理 N 个新子块，重跑同命令续跑；
+  未重建完的区间只是「该部分实体暂不配图」，不影响已重建部分。
+- **验证**：`uv run python -c "from storage.graph_store import ScienceGraphStore as S; g=S.load(); print(sum(1 for _,d in g.graph.nodes(data=True) if d.get('page_refs')))"`
+  输出带 `page_refs` 的节点数（0 表示还没重建）。
 
 ---
 
@@ -675,22 +741,28 @@ sida-agent/
   中英混排下与实际上下文窗口占用会有偏差。
 - **教材原图是整页扫描、不裁剪**（见 3.13）：一页常含多道题与手写批注，回答末尾附图
   占篇幅较大，用户需自己找题。裁剪到「单张图 / 单道题」未实现。
-- **只有带页码的两条链路能挂图**：`search_problems`（讲义页切片）与 `fetch_chunks`
-  （例题回表）。图谱上下文里的概念 / 公式 / 实验 / 题型 / 方法节点**不带页码**，
-  所以「概念讲解类」提问（如问某实验装置）目前在回答里看不到图——这属于待扩展项，
-  需给实体抽取增加页码字段（会使抽取缓存整体失效，代价为推理模型重抽）。
+- **只有页码可靠的路径能挂图**：`search_problems`（讲义页切片）、`fetch_chunks`（例题回表）
+  与图谱实体节点（概念 / 公式 / 实验 / 题型 / 方法的 `page_refs`）三条路径均可。仍有两类
+  页码缺失而不出图：① **未重建抽取层的旧库**——v4 之前建的实体没有 `page_refs`，需对已入库
+  教材重跑一次 `build`（推理 LLM 按子块重抽；视觉页缓存不受影响）；② **整章兜底路径
+  `get_chapter_subgraph` 常返回空集**——其成员筛选条件是 `Concept.chapter == 章节标题`，
+  而 `Chapter` 节点的 `title` 是教材目录标题、与概念 `chapter` 字段不同名，`resolve_chapter`
+  解析出的标题匹配不上任何概念。这是**先于本特性存在的缺陷**，本轮未修复（属已知项）。
 - **未补图的 PDF 会静默无图**：`render_image_section` 只输出**文件确实存在**的页，
   旧教材没重跑 `build` 时答案是干净的、不留死链，但也不会有图，且日志不报错（设计如此）。
-- **图区无数量上限**：`$contains` 逐字命中可能一次命中十几页（实测「验电器」命中 13 页），
-  回答末尾会连续挂十几张整页图。当前未做「按相关度取前 N 张」截断。
+- **图区上限是固定值、不按相关度排序**：`MAX_IMAGES_PER_ANSWER=6`，超额按来源优先级
+  截断（例题页 > 锚点概念 > 实验 > 公式 > 题型/方法 > 相邻概念），被放弃的页码记 info 日志。
+  同一优先级内部则按「实体内部页码升序」，不区分哪一页更切题——实测「验电器」这类枢纽概念
+  可聚合出 8 张以上候选，仍有取舍空间。
 - **图片体积可观**：长边 1600px PNG 实测约 `88~300 KB/页`，单本 240 页约 69 MB；
   多本累积到 GB 级属正常，需按需清理 `output/pdf_images/`。
 
 ### 待确认清单（代码无法判断业务原因，不下结论）
 
 - `SUBJECT_ANSWER_GUIDE` / 视觉 `PROMPT` 中若干提示词措辞的教学取舍依据，代码未注释原因。
-- `_EXTRACT_VERSION`（v2）与 `_EXTRACT_SCHEMA_VERSION`（v3）版本号不同步是否为有意设计
-  （两者分别管视觉页缓存与抽取结果缓存，代码未说明为何不统一）。
+- `_EXTRACT_VERSION`（v2）与 `_EXTRACT_SCHEMA_VERSION`（v4）版本号不同步是否为有意设计
+  （两者分别管视觉页缓存与抽取结果缓存，代码未说明为何不统一；而 v4 改名后确实只影响后者，
+  可作为「两套版本号分治有效」的例证）。
 - `EMBEDDING_BASE_URL` 示例端口在 `.env` 注释里写的是 `11636`（而非常见 `11434`），
   是否为该环境的自定义端口——以用户实际 `.env` 为准。
 

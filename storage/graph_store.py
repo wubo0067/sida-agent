@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""全科知识图谱:储：基于 NetworkX 的内存有向图（初中物理/化学/数学通用）。
+"""全科知识图谱存储：基于 NetworkX 的内存有向图（初中物理/化学/数学通用）。
 
 设计要点：
 - 所有实体节点以 `{subject}:{Kind}:{name}` 作为全局唯一键，
@@ -160,20 +160,26 @@ def bare_name(node_key_: str) -> str:
 
 
 # 各类实体在检索结果中的字段映射：kind -> {输出字段: (节点属性, 是否列表)}
+#
+# page_refs：该实体出现过的教材位置，形态为 ["{pdf_id}:{页码}", ...]（见
+# ingestion._write_graph）。问答链路据此把「概念/公式/实验」路径也配上教材原图，
+# 因此除例题外（例题出处已由 pdf_id + source.page 表达）都需要下发。
 _PAYLOAD_FIELDS = {
     K_FORMULA: {"name": (None, False), "expression": ("expression", False),
                 "symbols": ("symbols", True), "applicable_scope": ("applicable_scope", False),
-                "derivation": ("derivation", True), "sources": ("sources", True)},
+                "derivation": ("derivation", True), "sources": ("sources", True),
+                "page_refs": ("page_refs", True)},
     K_EXPERIMENT: {"name": (None, False), "purpose": ("purpose", False),
                    "apparatus": ("apparatus", True), "steps": ("steps", True),
                    "phenomenon": ("phenomenon", False), "conclusion": ("conclusion", False),
                    "diagram": ("diagram", False), "exam_focus": ("exam_focus", True),
-                   "sources": ("sources", True)},
+                   "sources": ("sources", True), "page_refs": ("page_refs", True)},
     K_QUESTION_TYPE: {"name": (None, False), "identify_features": ("identify_features", True),
                       "template": ("template", True), "traps": ("traps", True),
-                      "sources": ("sources", True)},
+                      "sources": ("sources", True), "page_refs": ("page_refs", True)},
     K_METHOD: {"name": (None, False), "scope": ("scope", False),
-               "steps": ("steps", True), "sources": ("sources", True)},
+               "steps": ("steps", True), "sources": ("sources", True),
+               "page_refs": ("page_refs", True)},
     K_EXAMPLE: {"id": (None, False), "title": ("title", False),
                 "question_type": ("question_type", False), "source": ("source", False),
                 "pdf_id": ("pdf_id", False)},
@@ -612,6 +618,7 @@ class ScienceGraphStore:
             "breakdown": list(cdata.get("breakdown", [])),
             "common_mistakes": list(cdata.get("common_mistakes", [])),
             "sources": list(cdata.get("sources", [])),
+            "page_refs": list(cdata.get("page_refs", [])),
         }
         log.debug("[graph_store] 从 %s 出发检索 1~2 跳子图", ckey)
 
@@ -696,12 +703,14 @@ class ScienceGraphStore:
                 "name": bare_name(key),
                 "description": nd.get("description", ""),
                 "sources": list(nd.get("sources", [])),
+                "page_refs": list(nd.get("page_refs", [])),
             })
         for key, nd in concept_followup:
             result["follow_ups"].append({
                 "name": bare_name(key),
                 "description": nd.get("description", ""),
                 "sources": list(nd.get("sources", [])),
+                "page_refs": list(nd.get("page_refs", [])),
             })
         for key, nd, rel in concept_related:
             result["related_concepts"].append({
@@ -709,6 +718,7 @@ class ScienceGraphStore:
                 "description": nd.get("description", ""),
                 "relation": rel or REL_EXTRA,
                 "sources": list(nd.get("sources", [])),
+                "page_refs": list(nd.get("page_refs", [])),
             })
         for key, nd in _capped("formulas", hop_buckets[K_FORMULA]):
             result["formulas"].append(_entity_payload(K_FORMULA, key, nd))
@@ -790,6 +800,7 @@ class ScienceGraphStore:
                         "relation": self.graph.get_edge_data(nb, key, {}).get("relation")
                         or self.graph.get_edge_data(key, nb, {}).get("relation") or REL_EXTRA,
                         "sources": list(nd.get("sources", [])),
+                        "page_refs": list(nd.get("page_refs", [])),
                     })
                 elif t in _BUCKET_OF and t != K_CONCEPT:
                     result[_BUCKET_OF[t]].append(_entity_payload(t, nb, nd))
