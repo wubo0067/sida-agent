@@ -527,6 +527,19 @@ def _load_cached_pages(pdf_path: str | Path, *, output_dir: str | Path | None = 
     return out
 
 
+def _emit(progress: Any, event: dict) -> None:
+    """向调用方进度回调推送一个事件；回调自身异常不得影响提取主流程。
+
+    progress 为 None（CLI 默认）时直接返回，因此对既有调用方零开销、零行为变化。
+    """
+    if progress is None:
+        return
+    try:
+        progress(event)
+    except Exception:  # noqa: BLE001 - 进度上报属于旁路信息，绝不允许打断建库
+        log.warning("[pdf_processor] progress 回调异常，已忽略: %s", event)
+
+
 def extract_pdf_pages_as_markdown(
     pdf_path: str,
     start_page: int,
@@ -535,6 +548,7 @@ def extract_pdf_pages_as_markdown(
     output_dir: str | Path | None = None,
     meter: Any | None = None,
     max_new_calls: int | None = None,
+    progress: Any | None = None,
 ) -> list[dict]:
     """截取 PDF 页面渲染成 PNG，用视觉大模型提取为结构化 Markdown。
 
@@ -556,6 +570,11 @@ def extract_pdf_pages_as_markdown(
             达到上限即提前停止，剩余未提取页仍落在下次重跑（逐页缓存 + 自动跳过
             已完成页保证续跑），与 build_knowledge_bases 的 max_chunks 同一套模式。
             视觉模型通常是更贵的多模态输入，传一个有限上限可分批消费、控成本。
+        progress: 可选回调 ``progress(event: dict)``，每处理完一页推一个
+            ``{"stage": "vision", "event": "page_done", "page": N, "cached": bool,
+            "done": i, "total": j}``，结束推 ``{"event": "vision_done", ...}``。
+            供 HTTP API 以 SSE 向前端播报进度（见 api/routers/build.py）；
+            CLI 不传即为 None，行为与之前完全一致。
 
     视觉模型固定由 config.py + sida-agent/.env 的 VISION_* 配置决定。
 
@@ -595,6 +614,9 @@ def extract_pdf_pages_as_markdown(
 
         log.info("[pdf_processor] PDF=%s（共 %d 页），提取第 %d-%d 页, id=%s",
                  pdf.name, total, start, end, pdf_id)
+        _emit(progress, {"stage": "vision", "event": "start", "pdf_id": pdf_id,
+                         "pdf_name": pdf.name, "start_page": start, "end_page": end,
+                         "total_pages": end - start + 1})
         pages_data: list[dict] = []
         new_calls = 0
         # 教材原图旁路：先行、独立于下面的提取循环按显示尺寸为范围内每页落盘一张图，
@@ -612,13 +634,18 @@ def extract_pdf_pages_as_markdown(
             page_file = _page_file_path(book_dir, page_no)
             if page_file.exists() and page_file.read_text(encoding="utf-8").strip():
                 content = page_file.read_text(encoding="utf-8").strip()
+                cached_hit = True
                 log.info("  [已提取] 第 %d 页（%s）", page_no, page_file.name)
             else:
+                cached_hit = False
                 # 达到本次新提取页上限即主动停：已完成页已落盘缓存，下次重跑
                 # 会跳过它们、从第一个未提取页继续，等价分批消费视觉模型成本。
                 if max_new_calls is not None and new_calls >= max_new_calls:
                     log.info("[pdf_processor] 已达本次新提取页上限 %d，停止（剩余页保留待下次续跑）",
                              max_new_calls)
+                    _emit(progress, {"stage": "vision", "event": "capped",
+                                     "max_new_calls": max_new_calls,
+                                     "processed_pages": len(pages_data)})
                     break
                 png = _render_page(doc.load_page(page_no - 1))
                 messages = [
@@ -642,6 +669,13 @@ def extract_pdf_pages_as_markdown(
                     log.warning("  ! 第 %d 页：模型返回内容为空，未写入缓存", page_no)
             if content:
                 pages_data.append({"page": page_no, "content": content})
+            _emit(progress, {"stage": "vision", "event": "page_done", "page": page_no,
+                             "cached": bool(cached_hit),
+                             "done": len(pages_data),
+                             "total_pages": end - start + 1})
+        _emit(progress, {"stage": "vision", "event": "vision_done",
+                         "processed_pages": len(pages_data),
+                         "new_vision_calls": new_calls})
         return pages_data
     finally:
         doc.close()

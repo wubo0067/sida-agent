@@ -44,8 +44,9 @@ import difflib
 import hashlib
 import json
 import re
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -1133,6 +1134,32 @@ def _extract_chunk_data(subject: str, md: str, label: str,
     return {**k_data, **q_data}
 
 
+def _emit_progress(progress: Optional[Callable[[dict], None]], event: dict) -> None:
+    """推送建库进度事件；无回调时直接返回，回调异常一律吞掉。
+
+    进度上报只是旁路信息（HTTP API 的 SSE 用），绝不允许因为它把建库打断。
+    """
+    if progress is None:
+        return
+    try:
+        progress(event)
+    except Exception:  # noqa: BLE001
+        log.warning("[ingestion] progress 回调异常，已忽略: %s", event)
+
+
+@contextmanager
+def _maybe_lock(lock: Optional[Any]):
+    """lock 为 None（CLI 默认）时是无开销的空上下文，传入时持锁进入临界区。"""
+    if lock is None:
+        yield
+        return
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _persist_chunk(chunk: List[Dict[str, Any]], subject: str,
                    vector_db: Chroma, graph_db: ScienceGraphStore,
                    data: Dict[str, Any], *, pdf_id: Optional[str] = None,
@@ -1182,6 +1209,8 @@ def build_knowledge_bases(
     meter: Any | None = None,
     pdf_id: Optional[str] = None,
     book_name: Optional[str] = None,
+    progress: Optional[Callable[[dict], None]] = None,
+    graph_lock: Optional[Any] = None,
 ) -> Tuple[Chroma, ScienceGraphStore]:
     """从 Markdown 中提取结构化知识网络，写入 Vector DB 与 Graph DB。
 
@@ -1210,6 +1239,14 @@ def build_knowledge_bases(
 
     推理模型固定由 config.py + sida-agent/.env 的 REASONING_* 配置决定。
     meter 为可选 TokenMeter 兼容对象（.add(response)），累计真实 token 消耗。
+
+    progress / graph_lock 为 HTTP API 侧服务（见 api/）而加，CLI 不传时行为不变：
+    - progress：回调 ``progress(event: dict)``，在切块完成、每个子块抽取/写库完成
+      与整轮结束时各推一个事件（``{"stage": "extract", "event": ...}``），
+      供 SSE 向前端播报；回调异常一律吞掉，不影响建库。
+    - graph_lock：可重入锁（threading.RLock）。graph_db 是单份内存图 + 整体
+      落盘，多任务并发写会互相覆盖；传入后「写库 + save」临界区持锁执行，
+      LLM 抽取（耗时主体）仍在锁外并行。
     """
     subject = normalize_subject(subject)
     log.info("[ingestion] 开始构建知识库: subject=%s, 输入页数=%d",
@@ -1222,9 +1259,13 @@ def build_knowledge_bases(
     chunks = _split_into_chunks(pages_data, max_chars=max_chars)
     log.info("[ingestion] 输入 %d 页自动切分为 %d 个子块（子块预算 %d 字符）",
              len(pages_data), len(chunks), max_chars)
+    _emit_progress(progress, {"stage": "extract", "event": "plan",
+                              "pages": len(pages_data), "total_chunks": len(chunks),
+                              "max_chars": max_chars})
     if not chunks:
         log.warning("[ingestion] 输入页为空，无可构建内容")
-        graph_db.save()
+        with _maybe_lock(graph_lock):
+            graph_db.save()
         return vector_db, graph_db
 
     done_new = 0          # 实际新调用 LLM 的子块数（缓存命中的不占 --max-chunks 额度）
@@ -1241,19 +1282,38 @@ def build_knowledge_bases(
                          "（已缓存块不再计费）", max_chunks, remain)
                 break
             done_new += 1
+            _emit_progress(progress, {"stage": "extract", "event": "chunk_start",
+                                      "chunk": idx, "total_chunks": len(chunks),
+                                      "label": label})
             data = _extract_chunk_data(subject, _chunk_markdown(chunk), label,
                                        vector_db, graph_db, meter=meter)
             _save_extract_cache(cache_key, data)
         else:
             log.info("[ingestion] %s 命中抽取缓存，直接写库（不调用 LLM）", label)
-        total_docs += _persist_chunk(chunk, subject, vector_db, graph_db, data,
-                                     pdf_id=pdf_id, book_name=book_name)
+            _emit_progress(progress, {"stage": "extract", "event": "chunk_start",
+                                      "chunk": idx, "total_chunks": len(chunks),
+                                      "label": label, "cached": True})
+        with _maybe_lock(graph_lock):
+            # _persist_chunk 内含「写图 + save」，整段即临界区（向量库
+            # add_documents 由 Chroma 自身并发保护，不必额外串行化）
+            docs = _persist_chunk(chunk, subject, vector_db, graph_db, data,
+                                  pdf_id=pdf_id, book_name=book_name)
+        total_docs += docs
+        _emit_progress(progress, {"stage": "extract", "event": "chunk_done",
+                                  "chunk": idx, "total_chunks": len(chunks),
+                                  "label": label, "docs": docs,
+                                  "nodes": graph_db.graph.number_of_nodes()})
 
     # 构建后审计：暴露空壳概念节点（幽灵节点）；审计放整轮结束后，避免逐块刷屏
     _audit_graph(graph_db, subject)
     # 兜底落盘：覆盖 max_chunks 提前退出等路径
-    graph_db.save()
+    with _maybe_lock(graph_lock):
+        graph_db.save()
 
     log.info("[ingestion] 构建完成（本轮新抽取子块 %d 个）: 图节点 %d 个, 向量切片 %d 条。",
              done_new, graph_db.graph.number_of_nodes(), total_docs)
+    _emit_progress(progress, {"stage": "extract", "event": "build_done",
+                              "new_chunks": done_new, "total_chunks": len(chunks),
+                              "docs": total_docs,
+                              "nodes": graph_db.graph.number_of_nodes()})
     return vector_db, graph_db

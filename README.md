@@ -638,6 +638,42 @@ uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完
 - **验证**：`uv run python -c "from storage.graph_store import ScienceGraphStore as S; g=S.load(); print(sum(1 for _,d in g.graph.nodes(data=True) if d.get('page_refs')))"`
   输出带 `page_refs` 的节点数（0 表示还没重建）。
 
+### 4.4 HTTP API 服务（`--stage serve`）
+
+把 CLI 的 `build` / `ask` / `chat` / 教材清单能力暴露为 HTTP 接口，供外部系统对接；
+问答与建库进度均支持 **SSE 流式**。启动：
+
+```powershell
+uv run python main.py --stage serve --host 127.0.0.1 --port 8000
+# 打开交互式文档 http://127.0.0.1:8000/docs （OpenAPI / Swagger）
+```
+
+启动时 `lifespan` 一次性加载双库（图谱 + 向量）与线程池、build 执行器；所有业务代码为同步
+（Chroma / NetworkX / SqliteSaver / LLM），统一经线程池执行，不阻塞事件循环。**无鉴权**，
+默认仅本机监听，跨机暴露请自行置于反向代理之后。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 存活检查：`{status, graph_nodes, vector_count}` |
+| GET | `/books` | 已入库教材清单（`pdf_id` + 名称） |
+| POST | `/ask` | 单轮问答，JSON 返回（含 `answer_path`，同时落盘 `output/answers/`） |
+| POST | `/ask/stream` | **SSE** 流式问答：逐 `token` 帧 → `result` 帧 → `event: end` |
+| GET | `/chat/sessions` | 会话列表（与 CLI **共用** `checkpoints.sqlite`） |
+| POST | `/chat/sessions` | 新建会话（可选传 `session_id`） |
+| GET | `/chat/sessions/{id}` | 读取某会话历史（`messages` + 摘要） |
+| POST | `/chat/sessions/{id}/messages` | 发一轮消息：`stream=true`（默认）走 SSE，否则 JSON |
+| POST | `/chat/sessions/{id}/export` | 导出会话 Markdown（`?download=true` 直接下载文件） |
+| POST | `/build/estimate` | 只读规模预估（不调模型），返回新增视觉 / 推理调用数 |
+| POST | `/build` | 提交异步建库任务，返回 `task_id`；已有任务在跑则 **409** |
+| GET | `/build/tasks` | 任务列表 |
+| GET | `/build/tasks/{id}` | 单任务状态快照 |
+| GET | `/build/tasks/{id}/events?since=N` | **SSE** 建库进度：`progress` 帧 → 终态 `task_status` 帧 |
+
+SSE 帧格式：每帧 `data: <json>\n\n`，流结束追加 `event: end\ndata: {}\n\n`。
+`/build` 的工作流：先 `POST /build/estimate` 看规模 → `POST /build`（`confirm:true` 放行）
+拿 `task_id` → 轮询 `GET /build/tasks/{id}` 或订阅 `/events`。build 任务注册表为**内存态**，
+服务重启后历史丢失，但重新提交同一区间会从磁盘缓存续跑（已缓存页 / 子块不再计费，写库幂等）。
+
 ---
 
 ## 5. 命令行参数表
@@ -646,7 +682,7 @@ uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完
 
 | 参数 | 类型 / 取值 | 默认值 | 作用 |
 |---|---|---|---|
-| `--stage` | `all` / `build` / `ask` / `chat` | `all` | `all`=提取+建库+问答；`build`=仅提取并累加进双库；`ask`=仅复用已持久化双库问答；`chat`=多轮对话 REPL |
+| `--stage` | `all` / `build` / `ask` / `chat` / `serve` | `all` | `all`=提取+建库+问答；`build`=仅提取并累加进双库；`ask`=仅复用已持久化双库问答；`chat`=多轮对话 REPL；`serve`=启动 FastAPI HTTP 服务（见 4.4） |
 | `--pdf` | str | `L:/vivi/初三/物理/9S合并PDF-完整.pdf` | 教材 PDF 路径（build/all 使用） |
 | `--book` | str（metavar 教材名） | `None` | 该 PDF 的教材显示名，用于答案「收录于《教材名》」来源标注；缺省取 PDF 文件名去扩展名；重复登记同一 `--pdf` 即改名覆盖 |
 | `--start-page` | int | `11` | 起始页码（从 1 计） |
@@ -660,6 +696,9 @@ uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完
 | `--max-chunks` | int（metavar N） | `None` | 本次建库最多处理 N 个未命中缓存的新子块（缓存命中不占额度），达上限即停、重跑续跑 |
 | `--max-new-calls` | int（metavar N） | `None` | 本次视觉提取最多新调用 N 次（已缓存页不占额度），达上限即停、重跑续跑（控视觉模型成本） |
 | `--yes` | flag | `False` | 跳过建库前的规模预估确认（脚本 / 夜间批量自动放行） |
+| `--host` | str | `127.0.0.1` | serve：HTTP 监听地址 |
+| `--port` | int | `8000` | serve：HTTP 监听端口 |
+| `--reload` | flag | `False` | serve：代码热重载（开发用，uvicorn reload） |
 
 > `--list` / `--export` 在 `main()` 里**先于 `--stage` 分发**处理，命中即执行并退出。
 > 不带任何参数运行 = 全部默认值（等价旧版硬编码流水线，便于快速回归）。
@@ -684,6 +723,13 @@ sida-agent/
 │   ├── graph_store.py         # ScienceGraphStore：node_key 规则、增删边、get_subgraph/get_entity_subgraph/章节聚合、实体+同族模糊解析、度数族匹配、概念级下钻+相关性截断、合并、save/load
 │   ├── vector_store.py        # get_vector_store：Chroma 持久化封装
 │   └── image_store.py         # 教材原图旁路：落盘/去重、引用归一化、图区渲染、路径重写（页缓存与抽取缓存全程不感知，见 3.13）
+├── api/                       # 阶段④：FastAPI HTTP 服务层（`--stage serve`，见 4.4）
+│   ├── app.py                 # create_app：lifespan 建 Runtime（双库+线程池+BuildRegistry）、CORS、挂载路由、/health
+│   ├── deps.py                # Runtime 单例、run_blocking（线程池跑同步业务）、SSE 生产者桥接（同步生成器→asyncio.Queue）
+│   ├── tasks.py               # BuildTask（事件环形缓冲+快照）与 BuildRegistry（单后台线程串行执行 build，避免双库并发写）
+│   ├── schemas.py             # Pydantic 请求/响应模型（Subject 限定三科、Estimate/Build/Chat/Ask 等）
+│   ├── runner.py              # 复用 main 的落盘/归一化 + workflow，把 ask/chat 包装成同步事件生成器（token 流）
+│   └── routers/               # books（GET /books）、ask（POST /ask、/ask/stream）、chat（会话 CRUD + 消息 SSE）、build（estimate / 提交 / 任务状态 / 事件 SSE）
 ├── pyproject.toml             # 依赖与 Python 版本声明
 ├── uv.lock                    # 锁定依赖版本
 ├── .env                       # 模型服务配置（被 .gitignore 忽略，不入库）
@@ -712,6 +758,7 @@ sida-agent/
 | `networkx` | 知识图谱（`DiGraph` + node_link JSON 读写） |
 | `langchain-core` / `openai` / `pydantic` | 消息 / 客户端 / 配置类型 |
 | `python-dotenv` | 读取 `.env` |
+| `fastapi` / `uvicorn[standard]` | HTTP API 服务层（见 4.4），SSE 用 FastAPI 内置 `StreamingResponse` |
 
 ---
 

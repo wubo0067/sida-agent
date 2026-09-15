@@ -100,10 +100,17 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--stage", choices=("all", "build", "ask", "chat"), default="all",
+        "--stage", choices=("all", "build", "ask", "chat", "serve"), default="all",
         help="all=提取+建库+问答；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；"
-             "chat=多轮对话（会话历史持久化，可 --session 续聊）。",
+             "chat=多轮对话（会话历史持久化，可 --session 续聊）；"
+             "serve=启动 FastAPI HTTP 服务（books/ask/chat/build 接口 + SSE 流式）。",
     )
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="serve：HTTP 监听地址（对外提供服务用 0.0.0.0）。")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="serve：HTTP 监听端口。")
+    parser.add_argument("--reload", action="store_true",
+                        help="serve：开发模式热重载（改代码自动重启，勿用于生产）。")
     parser.add_argument("--pdf", default=DEFAULT_PDF, help="教材 PDF 路径（build/all 阶段使用）。")
     parser.add_argument("--book", default=None, metavar="教材名",
                         help="该 PDF 的教材显示名（如「质心灵动量教育讲义」），用于答案里"
@@ -526,6 +533,16 @@ def main() -> None:
             log.error("[chat] 会话不存在或为空: %s", args.chat_export)
         else:
             log.info("[chat] 已导出会话 %s -> %s", args.chat_export, path.resolve())
+        return
+
+    # ---- serve 阶段：启动 FastAPI HTTP 服务（双库/线程池由 lifespan 管理） ----
+    if args.stage == "serve":
+        import uvicorn
+
+        log.info("[main] 启动 HTTP 服务：http://%s:%d  （文档 /docs）",
+                 args.host, args.port)
+        uvicorn.run("api.app:app", host=args.host, port=args.port,
+                    reload=args.reload)
         return
 
     # 共享的双库实例：跨进程持久化，多学科教材可累积进同一份知识库

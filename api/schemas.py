@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""API 请求 / 响应模型（Pydantic v2）。
+
+集中定义各端点的入参校验与出参结构，FastAPI 据此生成 /docs（OpenAPI）。
+"""
+
+from __future__ import annotations
+
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+from ingestion import _CHUNK_MAX_CHARS_DEFAULT
+
+Subject = Literal["physics", "chemistry", "math"]
+
+
+# ---- /books ----
+class BookItem(BaseModel):
+    pdf_id: str
+    name: str
+
+
+class BookList(BaseModel):
+    count: int
+    books: List[BookItem]
+
+
+# ---- /ask ----
+class AskRequest(BaseModel):
+    query: str = Field(..., min_length=1, description="学生提问")
+    subject: Optional[Subject] = Field(
+        None, description="可选：预选学科；缺省由 Agent 自动判定")
+    save: bool = Field(True, description="是否同时把讲解保存为 output/answers/*.md")
+
+
+class AskResult(BaseModel):
+    query: str
+    target_subject: Optional[str] = None
+    target_concept: Optional[str] = None
+    intent: Optional[str] = None
+    final_answer: str
+    answer_path: Optional[str] = Field(
+        None, description="save=true 时写出的 Markdown 路径")
+
+
+# ---- /chat ----
+class CreateSessionRequest(BaseModel):
+    session_id: Optional[str] = Field(
+        None, description="指定新会话 id；缺省自动生成 s-xxxx")
+
+
+class SessionSummary(BaseModel):
+    thread_id: str
+    updated_at: str = ""
+    turns: int = 0
+    first_question: str = ""
+    chars: int = 0
+
+
+class SessionList(BaseModel):
+    count: int
+    sessions: List[SessionSummary]
+
+
+class ChatMessage(BaseModel):
+    role: Literal["human", "ai"]
+    content: str
+
+
+class SessionDetail(BaseModel):
+    thread_id: str
+    history_summary: str
+    messages: List[ChatMessage]
+
+
+class ChatMessageRequest(BaseModel):
+    message: str = Field(..., min_length=1, description="本轮提问")
+    stream: bool = Field(True, description="true=SSE 逐 token；false=等完整结果(JSON)")
+
+
+class ChatTurnResult(BaseModel):
+    thread_id: str
+    reply: str
+    target_subject: Optional[str] = None
+    target_concept: Optional[str] = None
+    answer_path: Optional[str] = None
+
+
+class ExportResult(BaseModel):
+    thread_id: str
+    path: str
+
+
+# ---- /build ----
+class EstimateRequest(BaseModel):
+    pdf: str = Field(..., description="教材 PDF 路径")
+    start_page: int = Field(1, ge=1, alias="startPage")
+    end_page: int = Field(..., ge=1, alias="endPage")
+    subject: Subject = "physics"
+    max_chars: int = Field(_CHUNK_MAX_CHARS_DEFAULT, alias="maxChars")
+    max_new_calls: Optional[int] = Field(
+        None, alias="maxNewCalls", description="本批视觉新调用上限，同 CLI --max-new-calls")
+
+    model_config = {"populate_by_name": True}
+
+
+class EstimateResult(BaseModel):
+    range_pages: int
+    processed_pages: int
+    cached_pages: int
+    new_vision_calls: int
+    skipped_pages: int
+    plan_chunks: int
+    cached_chunks: int
+    new_chunks: int
+    approx_len: int
+    vision_capped: bool
+    new_calls_total: int = Field(
+        0, description="new_vision_calls + new_chunks*2，预估新增模型调用总量")
+
+
+class BuildRequest(EstimateRequest):
+    book: Optional[str] = Field(None, description="教材显示名，同 CLI --book")
+    max_chunks: Optional[int] = Field(None, alias="maxChunks")
+    confirm: bool = Field(
+        True, description="false 且存在新调用时不启动，仅回 409 让调用方看预估")
+
+
+class BuildAccepted(BaseModel):
+    task_id: str
+    status: str
+    estimate: EstimateResult
+
+
+class TaskStatus(BaseModel):
+    task_id: str
+    status: str
+    params: dict
+    error: Optional[str] = None
+    result: Optional[dict] = None
+    created_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    last_event_seq: int
+
+
+class TaskList(BaseModel):
+    count: int
+    tasks: List[TaskStatus]
