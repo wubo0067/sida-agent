@@ -20,6 +20,7 @@ from chat_session import open_saver, session_snapshot
 from logger import get_logger
 from main import (_CHAT_STREAM_NODES, _new_thread_id, _normalize_math_delims,
                   _save_answer_markdown)
+from storage.image_store import rewrite_image_paths_to_urls
 
 log = get_logger()
 
@@ -60,8 +61,13 @@ def _stream_agent(agent: Any, inputs: Dict[str, Any], config: Optional[Dict],
 
 
 def run_ask(query: str, *, vector_db: Any, graph_db: Any,
-            save: bool = True) -> Iterator[Dict[str, Any]]:
-    """单轮问答事件流：token… + 末尾 result（含 final_answer / 元信息 / 落盘路径）。"""
+            save: bool = True, image_base_url: str = "") -> Iterator[Dict[str, Any]]:
+    """单轮问答事件流：token… + 末尾 result（含 final_answer / 元信息 / 落盘路径）。
+
+    image_base_url：对外可访问的服务地址；非空时把 result.final_answer 里的
+    「教材原图」本地相对路径重写为 HTTP 绝对 URL（外部浏览器才能显示图片）。
+    落盘副本仍保留本地相对路径（由 _save_answer_markdown 处理），两者互不影响。
+    """
     from agent.workflow import create_circuit_agent  # 延迟导入，避免启动即建图
 
     agent = create_circuit_agent(vector_db=vector_db, graph_db=graph_db)
@@ -88,18 +94,22 @@ def run_ask(query: str, *, vector_db: Any, graph_db: Any,
         "target_subject": final.get("target_subject"),
         "target_concept": final.get("target_concept"),
         "intent": final.get("intent"),
-        "final_answer": final_answer,
+        "final_answer": rewrite_image_paths_to_urls(final_answer, image_base_url),
         "answer_path": out_path,
     }}
 
 
 def run_chat_turn(thread_id: str, message: str, *, vector_db: Any,
-                  graph_db: Any, save: bool = True) -> Iterator[Dict[str, Any]]:
+                  graph_db: Any, save: bool = True,
+                  image_base_url: str = "") -> Iterator[Dict[str, Any]]:
     """多轮对话的一轮事件流：token… + 末尾 result（reply + 元信息 + 落盘路径）。
 
     会话历史经 SqliteSaver（checkpointer）按 thread_id 持久化，与 CLI chat
     共用同一份 output/chat/checkpoints.sqlite。每轮独立开连接（with open_saver），
     避免跨请求共享非线程安全的单连接。
+
+    image_base_url：同 run_ask，非空时把 result.reply 里的「教材原图」链接重写为
+    HTTP 绝对 URL（回流进会话历史的 AIMessage 本就不含图片区块，不受影响）。
     """
     from agent.workflow import create_circuit_agent
 
@@ -126,7 +136,7 @@ def run_chat_turn(thread_id: str, message: str, *, vector_db: Any,
             log.exception("[api] chat 结果落盘失败")
     yield {"type": "result", "data": {
         "thread_id": thread_id,
-        "reply": reply,
+        "reply": rewrite_image_paths_to_urls(reply, image_base_url),
         "target_subject": final.get("target_subject"),
         "target_concept": final.get("target_concept"),
         "answer_path": out_path,

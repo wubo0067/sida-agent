@@ -14,11 +14,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from api import deps
 from api.deps import Runtime
 from api.routers import ask, books, build, chat
 from logger import get_logger
+from storage.image_store import IMAGE_ROOT, IMAGE_URL_MOUNT
 
 log = get_logger()
 
@@ -69,6 +71,17 @@ def create_app() -> FastAPI:
     app.include_router(ask.router)
     app.include_router(chat.router)
     app.include_router(build.router)
+
+    # 教材原图静态挂载：把 output/pdf_images 目录暴露为 /pdf_images/*，供外部
+    # 系统直接以 HTTP URL 加载回答末尾的「教材原图」PNG（PNG 带正确 MIME、
+    # 支持浏览器缓存）。API 出参里的图片链接由 image_store.
+    # rewrite_image_paths_to_urls 重写为 {base}/pdf_images/{pdf_id}/p页.png。
+    # StaticFiles 在目录不存在时构造即抛错，故先 mkdir 兜底（只问答未补图的
+    # 环境里目录可能还没建）；空目录挂载后访问任意图片返回 404，与
+    # render_image_section「只渲染已落盘图片」的防死链语义一致。
+    IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    app.mount(IMAGE_URL_MOUNT, StaticFiles(directory=IMAGE_ROOT),
+              name="pdf_images")
 
     @app.get("/health", tags=["meta"], summary="健康检查")
     async def health() -> dict:

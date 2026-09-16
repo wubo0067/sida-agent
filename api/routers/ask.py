@@ -11,7 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from api.deps import run_blocking, sse_from_producer
+from api.deps import resolve_image_base_url, run_blocking, sse_from_producer
 from api.runner import run_ask
 from api.schemas import AskRequest, AskResult
 
@@ -21,11 +21,13 @@ router = APIRouter(tags=["ask"])
 @router.post("/ask", response_model=AskResult, summary="单轮问答（完整 JSON）")
 async def ask(body: AskRequest, request: Request) -> AskResult:
     rt = request.app.state.runtime
+    base = resolve_image_base_url(request)
 
     def _produce() -> list:
         out: dict = {}
         for ev in run_ask(body.query, vector_db=rt.vector_db,
-                          graph_db=rt.graph_db, save=body.save):
+                          graph_db=rt.graph_db, save=body.save,
+                          image_base_url=base):
             if ev.get("type") == "result":
                 out = ev["data"]
         return [out]
@@ -37,7 +39,9 @@ async def ask(body: AskRequest, request: Request) -> AskResult:
 @router.post("/ask/stream", summary="单轮问答（SSE 流式）")
 async def ask_stream(body: AskRequest, request: Request) -> StreamingResponse:
     rt = request.app.state.runtime
+    base = resolve_image_base_url(request)
     producer = lambda: run_ask(body.query, vector_db=rt.vector_db,  # noqa: E731
-                               graph_db=rt.graph_db, save=body.save)
+                               graph_db=rt.graph_db, save=body.save,
+                               image_base_url=base)
     return StreamingResponse(sse_from_producer(producer),
                              media_type="text/event-stream")

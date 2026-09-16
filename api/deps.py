@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncIterator, Callable, Iterator, Optional
@@ -24,6 +25,17 @@ from storage.graph_store import ScienceGraphStore
 from storage.vector_store import get_vector_store
 
 log = get_logger()
+
+
+def resolve_image_base_url(request) -> str:
+    """回答里图片 URL 的绝对前缀：优先 .env 的 API_PUBLIC_BASE_URL，回退请求 host。
+
+    外部系统经 HTTP 拿到 Markdown 后，图片链接必须是可访问的绝对 URL。反向代理
+    / 自定义域名场景下 request.base_url 可能是内网地址，故允许用环境变量固定对外
+    地址（末尾带不带斜杠均可）。未配置时按当前请求推导，本机自测可直接用。
+    """
+    env = (os.getenv("API_PUBLIC_BASE_URL") or "").strip()
+    return (env or str(request.base_url)).rstrip("/")
 
 
 class Runtime:

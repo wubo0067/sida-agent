@@ -190,6 +190,7 @@ uv run python main.py --stage serve --host 127.0.0.1 --port 8000
 |---|---|---|
 | GET | `/health` | 存活检查：`{status, graph_nodes, vector_count}` |
 | GET | `/books` | 已入库教材清单（`pdf_id` + 名称） |
+| GET | `/pdf_images/{pdf_id}/p{页}.png` | **教材原图静态资源**：外部系统据此显示回答附图（见下） |
 | POST | `/ask` | 单轮问答，JSON 返回（含 `answer_path`，同时落盘 `output/answers/`） |
 | POST | `/ask/stream` | **SSE** 流式问答：逐 `token` 帧 → `result` 帧 → `event: end` |
 | GET | `/chat/sessions` | 会话列表（与 CLI **共用** `checkpoints.sqlite`） |
@@ -207,6 +208,15 @@ SSE 帧格式：每帧 `data: <json>\n\n`，流结束追加 `event: end\ndata: {
 `/build` 的工作流：先 `POST /build/estimate` 看规模 → `POST /build`（`confirm:true` 放行）
 拿 `task_id` → 轮询 `GET /build/tasks/{id}` 或订阅 `/events`。build 任务注册表为**内存态**，
 服务重启后历史丢失，但重新提交同一区间会从磁盘缓存续跑（已缓存页 / 子块不再计费，写库幂等）。
+
+> **回答里的「教材原图」如何在外部显示**：服务把 `output/pdf_images` 目录挂载为
+> `/pdf_images/*` 静态资源，并在 `/ask`、`/ask/stream`、`/chat/.../messages` 的 `result`
+> 事件里把图片链接重写为 HTTP 绝对 URL（`{base}/pdf_images/{pdf_id}/p{页}.png`），
+> 外部浏览器 / Markdown 渲染器据此直接显示原图。`{base}` 默认按请求 host 推导；
+> 反向代理 / 自定义域名场景下在 `.env` 设 `API_PUBLIC_BASE_URL` 固定对外地址。
+> 落盘到 `output/answers/`、`output/chat/exports/` 的 Markdown 副本不受影响，
+> 仍是相对本地路径（供本地阅读器打开）。SSE 的 `token` 帧不含图片区块，
+> 流式客户端在收到 `result` 帧时用完整内容替换即可看到图。
 
 #### curl 客户端用例（PowerShell）
 

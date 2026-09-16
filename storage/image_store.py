@@ -311,3 +311,34 @@ def relativize_image_paths(text: str, out_path: Path) -> str:
             return f"({abs_path.as_uri()})"
 
     return _ROOT_REL_IMAGE_RE.sub(_sub, text)
+
+
+# HTTP 静态挂载点前缀（见 api/app.py：app.mount(IMAGE_URL_MOUNT, StaticFiles(...))）。
+# 回答里的项目根相对路径「output/pdf_images/{pdf_id}/p页.png」映射到 URL 时，
+# 去掉「output/」本地目录层、换成挂载点，即 {base}/pdf_images/{pdf_id}/p页.png。
+IMAGE_URL_MOUNT = "/pdf_images"
+
+
+def rewrite_image_paths_to_urls(text: str, base_url: str) -> str:
+    """把回答里的项目根相对图片路径重写为 HTTP 绝对 URL（API 输出层专用）。
+
+    CLI 落盘的 Markdown 走 :func:`relativize_image_paths`（相对 md 文件目录，供
+    本地阅读器打开）；而 HTTP 接口把 Markdown 直接返回给外部系统时，相对/本地
+    绝对路径都无法解析——外部拿不到本机磁盘。本函数把图片链接换成
+    ``{base_url}/pdf_images/{pdf_id}/p页.png``，配合 app.py 挂载的静态目录，
+    外部浏览器 / Markdown 渲染器即可直接显示原图。
+
+    base_url 为空时原样返回（调用方未提供对外地址，退化为本地行为）。
+    仅改写图片链接目标，不动其它文本，与本地落盘链路完全解耦。
+    """
+    if not text or not base_url or IMAGE_REL_PREFIX not in text:
+        return text
+    base = base_url.rstrip("/")
+    mount = IMAGE_URL_MOUNT  # "/pdf_images"
+
+    def _sub(match: "re.Match[str]") -> str:
+        # group(1) 形如 output/pdf_images/{pdf_id}/p0059.png；剥掉本地目录层
+        tail = match.group(1)[len(IMAGE_REL_PREFIX):]
+        return f"({base}{mount}/{tail})"
+
+    return _ROOT_REL_IMAGE_RE.sub(_sub, text)

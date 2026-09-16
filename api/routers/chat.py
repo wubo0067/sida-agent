@@ -21,7 +21,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
-from api.deps import run_blocking, sse_from_producer
+from api.deps import (resolve_image_base_url, run_blocking,
+                      sse_from_producer)
 from api.runner import ensure_session, run_chat_turn, session_messages
 from api.schemas import (ChatMessageRequest, ChatTurnResult,
                         CreateSessionRequest, ExportResult, SessionDetail,
@@ -72,10 +73,11 @@ async def post_message(session_id: str, body: ChatMessageRequest,
                        request: Request):
     rt = request.app.state.runtime
     sid = _check_id(session_id)
+    base = resolve_image_base_url(request)
 
     def _producer() -> object:
         return run_chat_turn(sid, body.message, vector_db=rt.vector_db,
-                             graph_db=rt.graph_db)
+                             graph_db=rt.graph_db, image_base_url=base)
 
     if body.stream:
         return StreamingResponse(sse_from_producer(_producer),
@@ -85,7 +87,7 @@ async def post_message(session_id: str, body: ChatMessageRequest,
     def _collect() -> dict:
         out: Optional[dict] = None
         for ev in run_chat_turn(sid, body.message, vector_db=rt.vector_db,
-                                graph_db=rt.graph_db):
+                                graph_db=rt.graph_db, image_base_url=base):
             if ev.get("type") == "result":
                 out = ev["data"]
         if out is None:
