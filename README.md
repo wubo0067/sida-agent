@@ -208,6 +208,66 @@ SSE 帧格式：每帧 `data: <json>\n\n`，流结束追加 `event: end\ndata: {
 拿 `task_id` → 轮询 `GET /build/tasks/{id}` 或订阅 `/events`。build 任务注册表为**内存态**，
 服务重启后历史丢失，但重新提交同一区间会从磁盘缓存续跑（已缓存页 / 子块不再计费，写库幂等）。
 
+#### curl 客户端用例（PowerShell）
+
+> PowerShell 里 `curl` 默认是 `Invoke-WebRequest` 的别名，必须写 **`curl.exe`** 才是真 curl；
+> 单引号参数内的 JSON 双引号要写成 `\"`（PS 5.1 传参给原生程序时会剥掉裸引号）。
+> 若中文请求体出现乱码，先执行 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`。
+
+```powershell
+$base = "http://127.0.0.1:8000"
+
+# ---- 基础 ----
+# 存活检查
+curl.exe -sS "$base/health"
+# 已入库教材清单
+curl.exe -sS "$base/books"
+
+# ---- 单轮问答 ----
+# JSON 一次性返回（subject 可省略，由 Agent 自动判定；save=false 则不落盘 md）
+curl.exe -sS -X POST "$base/ask" `
+  -H "Content-Type: application/json" `
+  -d '{\"query\":\"讲解欧姆定律\",\"subject\":\"physics\",\"save\":true}'
+# SSE 流式问答：-N 关闭缓冲，逐 token 帧实时打印
+curl.exe -N -sS -X POST "$base/ask/stream" `
+  -H "Content-Type: application/json" `
+  -d '{\"query\":\"讲解欧姆定律\"}'
+
+# ---- 多轮会话（与 CLI chat 共用 checkpoints.sqlite）----
+# 会话列表 / 新建会话（可自定 id）
+curl.exe -sS "$base/chat/sessions"
+curl.exe -sS -X POST "$base/chat/sessions" `
+  -H "Content-Type: application/json" `
+  -d '{\"session_id\":\"s-demo01\"}'
+# 读取某会话历史（messages + 摘要）
+curl.exe -sS "$base/chat/sessions/s-demo01"
+# 发一轮提问：默认 SSE 流式
+curl.exe -N -sS -X POST "$base/chat/sessions/s-demo01/messages" `
+  -H "Content-Type: application/json" `
+  -d '{\"message\":\"讲解欧姆定律\"}'
+# 非流式：等完整结果返回 JSON
+curl.exe -sS -X POST "$base/chat/sessions/s-demo01/messages" `
+  -H "Content-Type: application/json" `
+  -d '{\"message\":\"那它的适用范围呢\",\"stream\":false}'
+# 导出会话 Markdown（加 ?download=true 直接下载文件内容）
+curl.exe -sS -X POST "$base/chat/sessions/s-demo01/export"
+curl.exe -sS -X POST "$base/chat/sessions/s-demo01/export?download=true" -o session.md
+
+# ---- 建库（异步任务）----
+# 只读规模预估（0 模型调用），先看要烧多少次调用
+curl.exe -sS -X POST "$base/build/estimate" `
+  -H "Content-Type: application/json" `
+  -d '{\"pdf\":\"L:/vivi/初三/物理/9S合并PDF-完整.pdf\",\"startPage\":11,\"endPage\":12,\"subject\":\"physics\"}'
+# 提交建库任务：confirm=true 放行新调用；成功返回 task_id（有任务在跑则 409）
+curl.exe -sS -X POST "$base/build" `
+  -H "Content-Type: application/json" `
+  -d '{\"pdf\":\"L:/vivi/初三/物理/9S合并PDF-完整.pdf\",\"startPage\":11,\"endPage\":12,\"subject\":\"physics\",\"confirm\":true}'
+# 任务列表 / 单任务状态 / SSE 进度流（since 为事件游标，断线后接着续传）
+curl.exe -sS "$base/build/tasks"
+curl.exe -sS "$base/build/tasks/<task_id>"
+curl.exe -N -sS "$base/build/tasks/<task_id>/events?since=0"
+```
+
 ---
 
 ## 4. 命令行参数表

@@ -307,10 +307,13 @@ def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> No
         print()
         printed = ""
         result: dict = {}
+        in_thinking = False
         try:
             # messages 模式推送生成节点 LLM 的逐 token 增量（delta 去重打印，
             # 兼容部分后端"先增量块、再完整块"的重复推送）；values 模式给每
             # 节点后的状态快照，取最后一份作为该轮最终结果供保存。
+            # 思考模式下的 reasoning_content 增量先以 [思考] 区块上屏，
+            # 正文首块到达时切回 [回答]，便于观察模型在想什么、卡在哪。
             for mode, chunk in agent.stream(
                 inputs, config=config, stream_mode=["messages", "values"],
             ):
@@ -318,8 +321,19 @@ def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> No
                     msg, meta = chunk
                     if meta.get("langgraph_node") not in _CHAT_STREAM_NODES:
                         continue
+                    ak = getattr(msg, "additional_kwargs", None) or {}
+                    reasoning = ak.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        if not in_thinking:
+                            in_thinking = True
+                            print("[思考] ", end="", flush=True)
+                        print(reasoning, end="", flush=True)
+                        continue
                     text = (msg.content if isinstance(msg.content, str) else "")
                     if text and len(text) > len(printed) and text.startswith(printed):
+                        if in_thinking:
+                            in_thinking = False
+                            print("\n\n[回答] ", end="", flush=True)
                         print(text[len(printed):], end="", flush=True)
                         printed = text
                 else:
@@ -612,11 +626,13 @@ def main() -> None:
         print("=" * 60)
         print("【解答生成结果】:\n")
         result: dict = {}
+        in_thinking = False
         try:
             # 流式输出：messages 模式把节点内 LLM 调用逐 token 推送（按
             # langgraph_node 过滤，只打印 generate_response 的正文，意图判定
             # 等节点的输出不上屏）；values 模式每个节点后给一份状态快照，
-            # 取最后一份作为最终结果供保存。
+            # 取最后一份作为最终结果供保存。思考模式的 reasoning_content
+            # 增量先以 [思考] 区块上屏，正文到达时切回正文输出。
             for mode, chunk in agent.stream(
                 {"query": args.query}, stream_mode=["messages", "values"],
             ):
@@ -624,6 +640,17 @@ def main() -> None:
                     msg, meta = chunk
                     if meta.get("langgraph_node") in ("generate_response",
                                                       "generate_problem_response"):
+                        ak = getattr(msg, "additional_kwargs", None) or {}
+                        reasoning = ak.get("reasoning_content")
+                        if isinstance(reasoning, str) and reasoning:
+                            if not in_thinking:
+                                in_thinking = True
+                                print("[思考] ", end="", flush=True)
+                            print(reasoning, end="", flush=True)
+                            continue
+                        if in_thinking:
+                            in_thinking = False
+                            print("\n\n", end="", flush=True)
                         print(str(msg.content), end="", flush=True)
                 else:
                     result = chunk

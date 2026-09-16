@@ -30,6 +30,9 @@ def _stream_agent(agent: Any, inputs: Dict[str, Any], config: Optional[Dict],
 
     messages 模式按节点过滤只保留生成节点正文增量（delta 去重，兼容后端
     「先增量块再完整块」的重复推送）；values 模式取最后一份状态快照作最终结果。
+    思考模式下生成节点会先推 reasoning_content 增量（由
+    config.ChatOpenAIWithReasoning 保留在 additional_kwargs），转成
+    {"type": "reasoning"} 事件先行推送，客户端可折叠展示思考过程。
     """
     printed = ""
     result: Dict[str, Any] = {}
@@ -41,6 +44,11 @@ def _stream_agent(agent: Any, inputs: Dict[str, Any], config: Optional[Dict],
         if mode == "messages":
             msg, meta = chunk
             if meta.get("langgraph_node") not in stream_nodes:
+                continue
+            ak = getattr(msg, "additional_kwargs", None) or {}
+            reasoning = ak.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                yield {"type": "reasoning", "text": reasoning}
                 continue
             text = msg.content if isinstance(msg.content, str) else ""
             if text and len(text) > len(printed) and text.startswith(printed):
