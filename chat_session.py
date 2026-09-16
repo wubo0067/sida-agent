@@ -26,6 +26,8 @@ from typing import Any, Iterator, List, Optional, Tuple
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from storage.image_store import relativize_image_paths
+
 # 检查点落盘目录（相对 sida-agent 工作目录，与 vector_db/graph 同根 output/）
 _CHAT_DB_DIR = Path("output") / "chat"
 
@@ -218,5 +220,8 @@ def export_session_md(thread_id: str,
             lines += ["**讲解**：", "", _normalize_math_delims(a), ""]
         else:
             lines += ["（该轮暂无回答）", ""]
-    path.write_text("\n".join(lines), encoding="utf-8")
+    # 回答里的「教材原图」路径以项目根为基准书写（见 storage/image_store），
+    # 这里按本文件实际位置换算成相对路径；exports/ 比 answers/ 深一层，
+    # 相对前缀不同，必须逐个换算才不会断链。
+    path.write_text(relativize_image_paths("\n".join(lines), path), encoding="utf-8")
     return path

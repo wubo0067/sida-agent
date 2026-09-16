@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 from typing import Any, List, Optional
 
@@ -26,6 +27,11 @@ from storage.graph_store import (
     K_QUESTION_TYPE,
     ScienceGraphStore,
     node_key,
+)
+from storage.image_store import (
+    refs_from_graph_context,
+    refs_from_metadatas,
+    render_image_section,
 )
 
 log = get_logger()
@@ -184,19 +190,50 @@ def _context_block(state: CircuitAgentState) -> str:
     return f"【对话背景（此前交流，供理解指代）】：\n{summary}{recent}\n"
 
 
-def _stream_answer(llm, prompt: str) -> str:
+def _stream_answer(llm, prompt: str, *, label: str = "stream") -> str:
     """以流式调用生成完整回答并返回拼接文本。
 
     节点内用 llm.stream 逐块产出：LangGraph 会把每个增量块作为
     stream_mode="messages" 的 token 推送（前端/CLI 据此逐字打印）；
     此处只负责把全部块拼回全文，写入 final_answer 与 AIMessage。
+    label 仅用于日志定位是哪个节点在生成；记录首块等待时间
+    （模型思考/排队段）与生成段耗时，长请求排查用。思考模式下端点会先推
+    reasoning_content 增量（由 config.ChatOpenAIWithReasoning 保留在
+    additional_kwargs），此处同步统计思考段耗时/字数并单独记日志；
+    思考增量本身经 LangGraph messages 流透传给 CLI/SSE 客户端展示。
     """
+    t0 = time.perf_counter()
+    log.info("[workflow.%s] 开始流式生成: prompt=%d 字符", label, len(prompt))
     out: List[str] = []
+    first_token_s: Optional[float] = None
+    reasoning_chars = 0
+    first_reasoning_s: Optional[float] = None
     for chunk in llm.stream(prompt):
+        ak = getattr(chunk, "additional_kwargs", None) or {}
+        reasoning = ak.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            if first_reasoning_s is None:
+                first_reasoning_s = time.perf_counter() - t0
+                log.info("[workflow.%s] 首个思考块到达, 等待 %.2fs（此前为排队/首 token 时间）",
+                         label, first_reasoning_s)
+            reasoning_chars += len(reasoning)
         content = getattr(chunk, "content", None)
-        if isinstance(content, str):
+        if isinstance(content, str) and content:
+            if first_token_s is None:
+                first_token_s = time.perf_counter() - t0
+                log.info("[workflow.%s] 正文首块到达, 等待 %.2fs（此前为模型排队/思考时间%s）",
+                         label, first_token_s,
+                         f", 思考输出 %d 字符/耗时 %.2fs" % (
+                             reasoning_chars, first_token_s - (first_reasoning_s or 0.0))
+                         if reasoning_chars else "")
             out.append(content)
-    return "".join(out)
+    total = time.perf_counter() - t0
+    text = "".join(out)
+    log.info("[workflow.%s] 流式生成结束: 输出 %d 字符 / %d 块, 总耗时 %.2fs, 生成段 %.2fs"
+             "（思考 %d 字符）",
+             label, len(text), len(out), total,
+             max(total - (first_token_s or 0.0), 0.0), reasoning_chars)
+    return text
 
 
 def create_circuit_agent(
@@ -213,7 +250,7 @@ def create_circuit_agent(
     log.info("[workflow] 构建全科问答 Agent 工作流")
     # 意图判定：只输出一行 JSON，追求短平快 —— 低温、小 max_tokens、关思考。
     intent_llm = get_reasoning_llm(temperature=0.0, max_tokens=128, enable_thinking=False)
-    # 最终讲解：需要长输出与推理质量 —— 沿用模型默认思考与较大 token 预算。
+    # 最终讲解：需要长输出与推理质量 —— nswer_llm.max_tokens is None，输出长度不受客户端限制，由 REASONING_MODEL 在服务端的默认生成上限决定
     answer_llm = get_reasoning_llm(temperature=0.3)
     # 上下文摘要：短输出压缩（chat 模式上下文管理用）。
     summary_llm = get_reasoning_llm(temperature=0.0, max_tokens=_CHAT_SUMMARY_MAX_TOKENS,
@@ -261,7 +298,11 @@ def create_circuit_agent(
             "直接输出更新后的摘要正文，不要任何前缀解释。"
         )
         try:
+            _t0 = time.perf_counter()
             new_summary = str(summary_llm.invoke(prompt).content).strip()
+            log.info("[workflow.manage_context] 摘要 LLM 返回, 耗时 %.2fs, "
+                     "旧对话 %d 字符 -> 摘要 %d 字符",
+                     time.perf_counter() - _t0, len(dropped_text), len(new_summary))
         except Exception:  # 摘要失败不阻断主链路：保留旧摘要继续走
             log.warning("[workflow.manage_context] 摘要生成失败，保留原摘要",
                         exc_info=True)
@@ -296,9 +337,13 @@ def create_circuit_agent(
             + (f"\n【对话背景】\n{background}" if background else "")
             + f"\n提问：{query}"
         )
-        log.debug("[workflow.analyze_intent] 调用 LLM 判定意图与锚点, query=%r", query)
-        subject, concept, intent, search_text = _parse_intent(
-            str(intent_llm.invoke(prompt).content))
+        log.debug("[workflow.analyze_intent] 调用 LLM 判定意图与锚点, query=%r, prompt=%d 字符",
+                  query, len(prompt))
+        _t0 = time.perf_counter()
+        raw_intent = str(intent_llm.invoke(prompt).content)
+        log.info("[workflow.analyze_intent] 意图 LLM 返回, 耗时 %.2fs, 原始输出: %s",
+                 time.perf_counter() - _t0, raw_intent[:300])
+        subject, concept, intent, search_text = _parse_intent(raw_intent)
         log.info("[workflow.analyze_intent] 判定结果: subject=%s, intent=%s, concept=%s, "
                  "search_text=%r",
                  _SUBJECT_LABEL.get(subject, subject), intent, concept, search_text)
@@ -318,6 +363,7 @@ def create_circuit_agent(
         # 上游 analyze_intent 的判定结果；缺省时保守回退到物理学科（最常见库）
         subject = state.get("target_subject") or "physics"
         concept = state.get("target_concept") or ""
+        _t0 = time.perf_counter()
         log.debug("[workflow.graph_traversal] 图谱聚合检索, subject=%s, concept=%s", subject, concept)
         # 第一级：按概念名直接做 1~2 跳聚合检索（get_subgraph 内部还有一次模糊解析，
         # 返回的 dict 里 concept 为 None 即表示图谱里根本没有这个概念节点）
@@ -384,16 +430,18 @@ def create_circuit_agent(
                     log.warning("[workflow.graph_traversal] 锚点概念 %r 为空壳且邻居无字面命中，"
                                 "章节兜底聚合整章 %r", concept, chapter)
                     subgraph = graph_db.get_chapter_subgraph(subject, chapter)
-        log.info("[workflow.graph_traversal] 命中: 公式 %d, 实验 %d, 题型 %d, 方法 %d, 例题 %d",
+        log.info("[workflow.graph_traversal] 命中: 公式 %d, 实验 %d, 题型 %d, 方法 %d, 例题 %d, "
+                 "检索总耗时 %.2fs",
                  len(subgraph.get("formulas", [])), len(subgraph.get("experiments", [])),
                  len(subgraph.get("question_types", [])), len(subgraph.get("methods", [])),
-                 len(subgraph.get("examples", [])))
+                 len(subgraph.get("examples", [])), time.perf_counter() - _t0)
         return {"graph_context": subgraph}
 
     def fetch_chunks_node(state: CircuitAgentState):
         g_ctx = state.get("graph_context", {})
         subject = state.get("target_subject") or "physics"
         examples = g_ctx.get("examples", [])
+        _t_all = time.perf_counter()
         log.debug("[workflow.fetch_chunks] 向量库回表, 例题数=%d", len(examples))
         # 例题原文按 (pdf_id, page) 回表取讲义页切片；同页多题只取一次。
         # 讲义页切片键带 pdf_id 前缀（subject:Page:{pdf_id}:{页码}），防止跨
@@ -410,12 +458,17 @@ def create_circuit_agent(
             if pk not in page_keys:
                 page_keys.append(pk)
         chunks: List[str] = []
-        for pk in page_keys:
+        for i, pk in enumerate(page_keys, 1):
+            _tk = time.perf_counter()
             results = vector_db.get(where={"id": pk})
-            if results and results.get("documents"):
+            hit = bool(results and results.get("documents"))
+            if hit:
                 chunks.append(results["documents"][0])
             else:
                 log.warning("[workflow.fetch_chunks] 向量库未命中讲义页: %s", pk)
+            log.info("[workflow.fetch_chunks] 回表进度 %d/%d: %s -> %s, 单页耗时 %.2fs",
+                     i, len(page_keys), pk, "命中" if hit else "未命中",
+                     time.perf_counter() - _tk)
         # 缺 page 的例题无法回表原文：例题自身的向量文档只是「编号+标题+题型」壳，
         # 从不含题干原文（原文只存在于按 page 索引的讲义页切片）。此处不再拿空壳
         # 冒充原文塞进 prompt，改为记 warning，让"典型例题原文"缺失显式可见。
@@ -423,7 +476,8 @@ def create_circuit_agent(
             if (ex.get("source") or {}).get("page") is None:
                 log.warning("[workflow.fetch_chunks] 例题缺 source.page，无法回表原文: %s",
                             ex.get("id", "?"))
-        log.info("[workflow.fetch_chunks] 回表得到原题切片 %d 条", len(chunks))
+        log.info("[workflow.fetch_chunks] 回表得到原题切片 %d 条（键 %d 个）, 总耗时 %.2fs",
+                 len(chunks), len(page_keys), time.perf_counter() - _t_all)
         return {"vector_chunks": chunks}
 
     def search_problems_node(state: CircuitAgentState):
@@ -439,20 +493,31 @@ def create_circuit_agent(
         """
         subject = state.get("target_subject") or "physics"
         text = (state.get("search_text") or "").strip() or (state.get("query") or "").strip()
+        _t_all = time.perf_counter()
         log.debug("[workflow.search_problems] 讲义页搜题, subject=%s, text=%r",
                   subject, text[:80])
         problem_chunks: List[str] = []
+        problem_images: List[Any] = []   # 命中页的 (pdf_id, 页码)，供回答末尾配「教材原图」
         if not text or vector_db is None:
             log.info("[workflow.search_problems] 无有效检索文本，跳过")
-            return {"problem_chunks": []}
+            return {"problem_chunks": [], "problem_images": []}
         # filter 顶层多字段 AND 必须显式 $and，否则 Chroma 抛
         # "Expected where to have exactly one operator"（同 _gather_known_context）。
         where: dict = {"$and": [{"subject": subject}, {"type": "Page"}]}
         try:
+            _t0 = time.perf_counter()
             got = vector_db.get(where=where, where_document={"$contains": text})
+            log.info("[workflow.search_problems] $contains 逐字查询返回, 耗时 %.2fs, 命中 %d 页",
+                     time.perf_counter() - _t0,
+                     len((got or {}).get("documents") or []))
             docs = (got or {}).get("documents") or []
+            metas = (got or {}).get("metadatas") or []
             if docs:
-                problem_chunks = [d for d in docs if d]
+                # documents 与 metadatas 按下标一一对应：先按「文档非空」配对再拆开，
+                # 避免单独过滤 docs 造成图片引用与页切片错位（配图张冠李戴）
+                pairs = [(d, m) for d, m in zip(docs, metas) if d]
+                problem_chunks = [d for d, _ in pairs]
+                problem_images = refs_from_metadatas(m for _, m in pairs)
                 log.info("[workflow.search_problems] 原文逐字命中讲义页 %d 页",
                          len(problem_chunks))
         except Exception:  # noqa: BLE001
@@ -460,8 +525,11 @@ def create_circuit_agent(
                         exc_info=True)
         if not problem_chunks:
             try:
+                _t1 = time.perf_counter()
                 hits = vector_db.similarity_search_with_score(
                     text, k=_SEARCH_PROBLEM_RERANK_K, filter=where)
+                log.info("[workflow.search_problems] 语义检索返回 %d 候选, 耗时 %.2fs（含 embedding 调用）",
+                         len(hits), time.perf_counter() - _t1)
             except Exception:  # noqa: BLE001
                 log.warning("[workflow.search_problems] 语义搜题失败", exc_info=True)
                 hits = []
@@ -469,12 +537,15 @@ def create_circuit_agent(
                 ((_bigram_overlap(text, doc.page_content), dist, doc)
                  for doc, dist in hits),
                 key=lambda x: (-x[0], x[1]))
-            problem_chunks = [doc.page_content for _, _, doc in
-                              ranked[:_SEARCH_PROBLEM_TOP_K] if doc.page_content]
+            top_docs = [doc for _, _, doc in ranked[:_SEARCH_PROBLEM_TOP_K]
+                        if doc.page_content]
+            problem_chunks = [doc.page_content for doc in top_docs]
+            problem_images = refs_from_metadatas(doc.metadata for doc in top_docs)
             log.info("[workflow.search_problems] 语义兜底重排后取 %d 页（候选 %d 页）",
                      len(problem_chunks), len(hits))
-        log.info("[workflow.search_problems] 命中讲义页 %d 页", len(problem_chunks))
-        return {"problem_chunks": problem_chunks}
+        log.info("[workflow.search_problems] 命中讲义页 %d 页（可配原图 %d 张）, 检索总耗时 %.2fs",
+                 len(problem_chunks), len(problem_images), time.perf_counter() - _t_all)
+        return {"problem_chunks": problem_chunks, "problem_images": problem_images}
 
     def generate_problem_response_node(state: CircuitAgentState):
         """搜题专用生成：从命中的整页讲义原文里定位目标题，原题呈现并简要讲解。"""
@@ -518,12 +589,25 @@ def create_circuit_agent(
    学科常识），解析要精炼，不展开与本题无关的知识。
 4. 只依据上方讲义页原文作答，不得虚构教材里没有的题目内容。
 """
-        response = _stream_answer(answer_llm, final_prompt)
+        log.info("[workflow.generate_problem_response] 提示词组装完成: %d 字符（讲义页 %d 页, 页码=%s）",
+                 len(final_prompt), len(chunks), pages_label)
+        response = _stream_answer(answer_llm, final_prompt,
+                                  label="generate_problem_response")
         log.info("[workflow.generate_problem_response] 搜题解答生成完成, 长度=%d 字符",
                  len(response))
+        # 教材原图：按命中页切片的 (pdf_id, 页码) 确定性追加到**回答末尾**，不让
+        # LLM 参与链接生成（模型写图片链接的可靠性很低，与公式定界符同理）。
+        _prob_refs = state.get("problem_images") or []
+        _t_img = time.perf_counter()
+        image_section = render_image_section(_prob_refs)
+        log.info("[workflow.generate_problem_response] 教材原图区块: 引用 %d 个 -> %d 字符, 耗时 %.3fs",
+                 len(_prob_refs), len(image_section), time.perf_counter() - _t_img)
         # final_answer 供单轮 ask/all 复用（main 保存 md）；AIMessage 供
         # chat 模式把回答写回 messages 会话历史（由 checkpointer 持久化）。
-        return {"final_answer": response, "messages": [AIMessage(content=response)]}
+        # 原图区块只进 final_answer：它是给人看的输出产物，没必要回流进对话历史
+        #   白占 token（下一轮模型读到一段图片语法毫无意义）。
+        return {"final_answer": response + image_section,
+                "messages": [AIMessage(content=response)]}
 
     def generate_response_node(state: CircuitAgentState):
         g_ctx = state.get("graph_context", {})
@@ -644,7 +728,8 @@ def create_circuit_agent(
 
         examples_text = "\n\n".join(_tag_chunk(c) for c in chunks)
         # 讲义页切片自带「--- 第 N 页 ---」头，据此列出命中页码供模型标注来源；
-        # 图谱实体（公式/实验/题型/方法）抽取时不记页码，只能标注到「知识图谱」粒度。
+        # 图谱实体（公式/实验/题型/方法）命中时没有切片、页码另在节点的 page_refs 上
+        # （见 _persist_chunk → image_store.refs_from_graph_context），故此处只报讲义页。
         pages_hit = sorted({int(n) for c in chunks for n in re.findall(r"--- 第 (\d+) 页 ---", c)})
         if pages_hit:
             uniq_books = {page_books[p][0] for p in pages_hit
@@ -731,11 +816,29 @@ def create_circuit_agent(
      收录教材信息则带上《教材名》），只是不得引用具体页码；宁可说明不确定，
      也不要编造页码。
 """
-        response = _stream_answer(answer_llm, final_prompt)
+        log.info(
+            "[workflow.generate_response] 提示词组装完成: %d 字符（概念块 %d/公式 %d/实验 %d/"
+            "题型 %d/方法 %d/例题原文 %d 字符）",
+            len(final_prompt), len(concept_block), len(formula_block),
+            len(experiment_block), len(qtype_block), len(method_block),
+            len(examples_text))
+        response = _stream_answer(answer_llm, final_prompt, label="generate_response")
         log.info("[workflow.generate_response] 解答生成完成, 长度=%d 字符", len(response))
+        # 教材原图：按本轮命中的 (pdf_id, 页码) 确定性追加到回答末尾。页码有两路来源，
+        # 由 refs_from_graph_context 一并汇总并按优先级占用配额（例题页优先，其次锚点概念、
+        # 实验、公式、题型/方法，最后相邻概念）：搜题路径取命中页切片的出处，概念/公式/实验
+        # 讲解路径取图谱节点的 page_refs（见 ingestion._write_graph → 节点属性）。未落盘的
+        # 图片被 render_image_section 过滤，故未补图的教材不产死链、也不占配额。
+        _g_refs = refs_from_graph_context(g_ctx)
+        _t_img = time.perf_counter()
+        image_section = render_image_section(_g_refs)
+        log.info("[workflow.generate_response] 教材原图区块: 引用 %d 个 -> %d 字符, 耗时 %.3fs",
+                 len(_g_refs), len(image_section), time.perf_counter() - _t_img)
         # final_answer 供单轮 ask/all 复用（main 保存 md）；AIMessage 供
         # chat 模式把回答写回 messages 会话历史（由 checkpointer 持久化）。
-        return {"final_answer": response, "messages": [AIMessage(content=response)]}
+        # 原图区块只进 final_answer，理由同 generate_problem_response_node。
+        return {"final_answer": response + image_section,
+                "messages": [AIMessage(content=response)]}
 
     def respond_chitchat_node(state: CircuitAgentState):
         """闲聊/与知识库无关话题的轻量直答：不触发图谱/向量检索。
@@ -753,7 +856,7 @@ def create_circuit_agent(
             + (f"【对话背景】\n{background}\n" if background else "")
             + f"学生说：{query}"
         )
-        response = _stream_answer(answer_llm, prompt)
+        response = _stream_answer(answer_llm, prompt, label="respond_chitchat")
         log.info("[workflow.respond_chitchat] 闲聊回复完成, 长度=%d 字符", len(response))
         return {"final_answer": response, "messages": [AIMessage(content=response)]}
 

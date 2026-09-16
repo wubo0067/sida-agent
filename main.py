@@ -68,6 +68,7 @@ from logger import get_logger
 from pdf_processor import (_load_cached_pages, _pdf_id,
                            extract_pdf_pages_as_markdown)
 from storage.graph_store import ScienceGraphStore
+from storage.image_store import relativize_image_paths
 from storage.vector_store import get_vector_store
 
 log = get_logger()
@@ -99,10 +100,17 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--stage", choices=("all", "build", "ask", "chat"), default="all",
+        "--stage", choices=("all", "build", "ask", "chat", "serve"), default="all",
         help="all=提取+建库+问答；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；"
-             "chat=多轮对话（会话历史持久化，可 --session 续聊）。",
+             "chat=多轮对话（会话历史持久化，可 --session 续聊）；"
+             "serve=启动 FastAPI HTTP 服务（books/ask/chat/build 接口 + SSE 流式）。",
     )
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="serve：HTTP 监听地址（对外提供服务用 0.0.0.0）。")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="serve：HTTP 监听端口。")
+    parser.add_argument("--reload", action="store_true",
+                        help="serve：开发模式热重载（改代码自动重启，勿用于生产）。")
     parser.add_argument("--pdf", default=DEFAULT_PDF, help="教材 PDF 路径（build/all 阶段使用）。")
     parser.add_argument("--book", default=None, metavar="教材名",
                         help="该 PDF 的教材显示名（如「质心灵动量教育讲义」），用于答案里"
@@ -182,7 +190,10 @@ def _save_answer_markdown(result: dict, fallback_subject: str) -> Path:
         "", "## 提问", "", result.get("query", ""),
         "", "## 讲解", "", result.get("final_answer", ""), "",
     ]
-    path.write_text("\n".join(lines), encoding="utf-8")
+    # 回答里的「教材原图」路径以项目根为基准书写（见 storage/image_store），
+    # 这里按本文件实际位置换算成相对路径——Markdown 阅读器按 md 所在目录解析
+    # 相对路径，不换算就会在 output/answers/ 下断链。
+    path.write_text(relativize_image_paths("\n".join(lines), path), encoding="utf-8")
     return path
 
 
@@ -296,10 +307,13 @@ def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> No
         print()
         printed = ""
         result: dict = {}
+        in_thinking = False
         try:
             # messages 模式推送生成节点 LLM 的逐 token 增量（delta 去重打印，
             # 兼容部分后端"先增量块、再完整块"的重复推送）；values 模式给每
             # 节点后的状态快照，取最后一份作为该轮最终结果供保存。
+            # 思考模式下的 reasoning_content 增量先以 [思考] 区块上屏，
+            # 正文首块到达时切回 [回答]，便于观察模型在想什么、卡在哪。
             for mode, chunk in agent.stream(
                 inputs, config=config, stream_mode=["messages", "values"],
             ):
@@ -307,8 +321,19 @@ def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> No
                     msg, meta = chunk
                     if meta.get("langgraph_node") not in _CHAT_STREAM_NODES:
                         continue
+                    ak = getattr(msg, "additional_kwargs", None) or {}
+                    reasoning = ak.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        if not in_thinking:
+                            in_thinking = True
+                            print("[思考] ", end="", flush=True)
+                        print(reasoning, end="", flush=True)
+                        continue
                     text = (msg.content if isinstance(msg.content, str) else "")
                     if text and len(text) > len(printed) and text.startswith(printed):
+                        if in_thinking:
+                            in_thinking = False
+                            print("\n\n[回答] ", end="", flush=True)
                         print(text[len(printed):], end="", flush=True)
                         printed = text
                 else:
@@ -524,6 +549,16 @@ def main() -> None:
             log.info("[chat] 已导出会话 %s -> %s", args.chat_export, path.resolve())
         return
 
+    # ---- serve 阶段：启动 FastAPI HTTP 服务（双库/线程池由 lifespan 管理） ----
+    if args.stage == "serve":
+        import uvicorn
+
+        log.info("[main] 启动 HTTP 服务：http://%s:%d  （文档 /docs）",
+                 args.host, args.port)
+        uvicorn.run("api.app:app", host=args.host, port=args.port,
+                    reload=args.reload)
+        return
+
     # 共享的双库实例：跨进程持久化，多学科教材可累积进同一份知识库
     vector_db = get_vector_store()          # Chroma 本地持久化，自动加载历史切片
     graph_db = ScienceGraphStore.load()     # 有历史图谱则加载，无则新建空库
@@ -591,11 +626,13 @@ def main() -> None:
         print("=" * 60)
         print("【解答生成结果】:\n")
         result: dict = {}
+        in_thinking = False
         try:
             # 流式输出：messages 模式把节点内 LLM 调用逐 token 推送（按
             # langgraph_node 过滤，只打印 generate_response 的正文，意图判定
             # 等节点的输出不上屏）；values 模式每个节点后给一份状态快照，
-            # 取最后一份作为最终结果供保存。
+            # 取最后一份作为最终结果供保存。思考模式的 reasoning_content
+            # 增量先以 [思考] 区块上屏，正文到达时切回正文输出。
             for mode, chunk in agent.stream(
                 {"query": args.query}, stream_mode=["messages", "values"],
             ):
@@ -603,6 +640,17 @@ def main() -> None:
                     msg, meta = chunk
                     if meta.get("langgraph_node") in ("generate_response",
                                                       "generate_problem_response"):
+                        ak = getattr(msg, "additional_kwargs", None) or {}
+                        reasoning = ak.get("reasoning_content")
+                        if isinstance(reasoning, str) and reasoning:
+                            if not in_thinking:
+                                in_thinking = True
+                                print("[思考] ", end="", flush=True)
+                            print(reasoning, end="", flush=True)
+                            continue
+                        if in_thinking:
+                            in_thinking = False
+                            print("\n\n", end="", flush=True)
                         print(str(msg.content), end="", flush=True)
                 else:
                     result = chunk
