@@ -17,7 +17,7 @@ import difflib
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -50,10 +50,14 @@ REL_EXEMPLIFIED_BY = "EXEMPLIFIED_BY"     # 题型/方法 -> 例题
 REL_TESTS = "TESTS"                       # 例题 -> 概念（原题考到的知识点）
 REL_EXTRA = "EXTRA"                       # 其它补充关系
 
-# 概念锚点的常见教学修饰尾缀（意图判定 LLM 常把"分析/思路/方法/讲解"拼进锚点名）
+# 概念锚点的常见教学修饰尾缀（意图判定 LLM 常把"分析/思路/方法/讲解"拼进锚点名）。
+# "题型/考点"是学生口语里最常见的类别词（"二次函数动轴动区间题型"，图谱里只有
+# "动轴动区间"），剥掉后即精确命中；这一步只在剥完能命中真实节点名时生效，
+# 因此对本来就能精确命中的锚点没有任何副作用。
 _CONCEPT_SUFFIXES = (
     "的分析", "的思路", "的方法", "的讲解", "的规律", "的问题",
     "分析", "思路", "方法", "讲解", "总结", "归纳", "综合",
+    "题型", "考点",
 )
 # difflib 模糊兜底的相似度阈值
 _FUZZY_THRESHOLD = 0.6
@@ -75,13 +79,38 @@ _FAMILY_MIN_LEN = 3
 _DEGREE_RE = re.compile(r"\d+(?:\.\d+)?°")
 
 # 锚点相关性排序用的「判别 token」：角度数字、连续中文、连续西文（长度 >=2）。
-# top-N 截断前按 token 命中数降序排（稳定排序，同分保持插入序），保证与提问直接
+# top-N 截断前按 token 相关性评分降序排（稳定排序，同分保持插入序），保证与提问直接
 # 相关的实体（锚点 "18°三角函数" 之于公式 "18°角的正弦值"）不被截掉。
 _ANCHOR_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?°|[A-Za-z]+|[\u4e00-\u9fff]+")
+
+# 「强标识」token：角度数字与连续西文段。它们与中文 n-gram 不是一个量级——
+# 18° 就只能是 18°，是**穷举型**标识；而中文 n-gram 重合只说明"像"。
+_ANCHOR_STRONG_RE = re.compile(r"\d+(?:\.\d+)?°|[A-Za-z]+")
+
+# 强标识的评分权重，远高于中文 n-gram 重合（最长 4 字窗口也只有 16 分）。
+# 若不加区分：锚点 "18°三角函数" 会让一堆名字里带"三角函数"的通用公式各得 40+ 分，
+# 压掉真正含 18° 的那两条（只得 9 分），把 6.9 修好的度数匹配又打回去。
+_ANCHOR_STRONG_WEIGHT = 100
+
+# 连续中文的滑窗长度：2 字保召回（"动轴"），4 字保精度（"动轴动区"）。
+_ANCHOR_NGRAM_SIZES = (2, 3, 4)
 
 # get_subgraph 每类关联实体的默认返回上限：命中"枢纽概念"（关联几十条公式/例题）时
 # 截断至 top-N，防止下游问答 prompt 被撑爆；None 表示不限。
 _DEFAULT_MAX_PER_KIND = 8
+
+# top-N 截断的「来源配额」（见 _reserve_source_slots）：importance 是**全图**中心性
+# （storage.graph_analysis 的度/介数/特征向量加权），跨教材不可比——一本被反复考过
+# 的老书会把枢纽实体抬到 6~8，新入库教材的实体只有 0.8，于是 top-8 被单本老书占满，
+# 新书里对题的内容结构性地永远选不上（"知识在库里却检索不到"的第二层原因，
+# 第一层是锚点相关性评分，见 6.9）。
+# 触发：单本教材独占 top-N 的 >= 3/4 席位；动作：给「完全没进 top-N 的教材」换入
+# 最多 _QUOTA_MAX_SLOTS 条候选（换掉该教材排名最末的同数量条目）。
+# 每本教材最多占 1 个保留席位，所以实际换入数可能少于 _QUOTA_MAX_SLOTS。
+_QUOTA_TRIGGER_SHARE = 0.75
+_QUOTA_MAX_SLOTS = 2
+# 候补条目的相关性下限（相对于 top-N 内的最高相关性），防止为了多样性塞进不相关内容。
+_QUOTA_MIN_RATIO = 0.34
 
 # 存储时不需要入检索/向量回表的实体类型
 _RETRIEVABLE = (K_CONCEPT, K_FORMULA, K_EXPERIMENT, K_QUESTION_TYPE, K_METHOD, K_EXAMPLE)
@@ -187,12 +216,42 @@ _PAYLOAD_FIELDS = {
 
 
 def _anchor_tokens(name: str) -> List[str]:
-    """从锚点名提取判别 token（角度数字 / 连续中文 / 连续西文，长度 >=2）。"""
-    return [t for t in _ANCHOR_TOKEN_RE.findall(name or "") if len(t) >= 2]
+    """从锚点名提取判别 token（角度数字 / 连续中文 n-gram / 连续西文，长度 >=2）。
+
+    连续中文按 2~4 字滑窗切开，而不是整段保留。原因：节点名与学生问法几乎不可能
+    逐字相同（锚点 "二次函数动轴动区间题型" vs 节点名 "动轴动区间"），整段 token
+    在全图谱的命中数恒为 0，_capped 的排序主键失效后只剩 importance 兜底——旧书里
+    被考烂的枢纽概念（importance 6~8）会结构性压掉新书权重低但对题的内容（0.8）。
+    度数/西文段不切窗：它们本身就是最小判别单位（见 _ANCHOR_STRONG_WEIGHT）。
+    """
+    tokens: List[str] = []
+    for raw in _ANCHOR_TOKEN_RE.findall(name or ""):
+        if len(raw) < 2:
+            continue
+        tokens.append(raw)          # 整串保留：节点名完整包含锚点时是最强证据
+        if _ANCHOR_STRONG_RE.fullmatch(raw):
+            continue
+        for size in _ANCHOR_NGRAM_SIZES:
+            if size >= len(raw):    # 等于整串的情况上面已收录
+                continue
+            tokens.extend(raw[i:i + size] for i in range(len(raw) - size + 1))
+    return list(dict.fromkeys(tokens))   # 去重且保序，避免重复计分
 
 
-def _node_relevance(item: Any, tokens: List[str]) -> int:
-    """条目与锚点 token 的相关性 = 命中的 token 数。兼容 (key, nd) 与 payload dict。"""
+def _anchor_token_weight(token: str) -> int:
+    """单个 token 的评分权重：强标识（度数/西文）给固定高权重，中文按长度平方。"""
+    if _ANCHOR_STRONG_RE.fullmatch(token):
+        return _ANCHOR_STRONG_WEIGHT
+    return len(token) * len(token)
+
+
+def _node_relevance(item: Any, tokens: List[str]) -> float:
+    """条目与锚点的相关性评分 = 命中 token 的权重之和。兼容 (key, nd) 与 payload dict。
+
+    用**长度平方**加权而非「命中 token 条数」：命中 4 字窗口得 16 分，远高于命中 2 字
+    窗口的 4 分。这样既不丢召回（问法与节点名只要有 2 字重合就能上分，不再全 0），
+    又不会被长名字的常见双字词刷分——一个条目只要与锚点有一段长重合，多半讲的就是
+    这件事。"""
     if isinstance(item, tuple):
         key, nd = item
         parts = [bare_name(key), nd.get("title", ""),
@@ -201,7 +260,112 @@ def _node_relevance(item: Any, tokens: List[str]) -> int:
         parts = [item.get("name", ""), item.get("id", ""), item.get("title", ""),
                  item.get("question_type", ""), item.get("expression", "")]
     text = " ".join(str(p) for p in parts if p)
-    return sum(1 for tk in tokens if tk in text)
+    return float(sum(_anchor_token_weight(tk) for tk in tokens if tk in text))
+
+
+def _item_sources(item: Any) -> FrozenSet[str]:
+    """条目所属教材（pdf_id 集合）。兼容 ``(key, nd)`` 与 _entity_payload 的 dict。
+
+    三路线索取并集：例题节点的 ``pdf_id``、普通实体的 ``sources`` 列表、``page_refs``
+    的 ``"{pdf_id}:{页码}"`` 前缀（跨子块合并出来的老节点可能只剩 page_refs）。
+    完全取不到来源信息时返回空集合，配额据此判定「无法讨论教材多样性」而放弃——
+    未传 pdf_id 建库的旧图谱因此完全不受影响。
+    """
+    nd = item[1] if isinstance(item, tuple) else item
+    ids: List[str] = []
+    pid = nd.get("pdf_id")
+    if pid:
+        ids.append(str(pid))
+    srcs = nd.get("sources")
+    if isinstance(srcs, (list, tuple, set, frozenset)):
+        ids.extend(str(s) for s in srcs if s)
+    elif srcs:
+        ids.append(str(srcs))
+    refs = nd.get("page_refs")
+    if isinstance(refs, (list, tuple, set, frozenset)):
+        ids.extend(str(r).split(":", 1)[0] for r in refs if r)
+    return frozenset(i for i in ids if i)
+
+
+def _item_key(item: Any) -> str:
+    """条目对应的节点键（dict 形态用 id/name 兜底），用于 matched 排除判断。"""
+    if isinstance(item, tuple):
+        return item[0]
+    return str(item.get("id") or item.get("name") or "")
+
+
+def _item_rank(item: Any, tokens: List[str]) -> Tuple[float, float]:
+    """排序键 = (锚点相关性评分, importance) 双降序（_capped 与配额共用）。"""
+    nd = item[1] if isinstance(item, tuple) else item
+    return (_node_relevance(item, tokens), float(nd.get("importance", 0) or 0))
+
+
+def _reserve_source_slots(items: List[Any], max_per_kind: int, tokens: List[str],
+                          excluded: Set[str]) -> Tuple[List[Any], List[Any]]:
+    """给「完全没进 top-N 的教材」保留席位，返回 (截断后的 items, 换入的条目)。
+
+    前提：``items`` 已按 _item_rank 降序排好（调用方负责）。本函数只做两件事：
+    判定 top-N 是否被单本教材独占，以及从尾部挑出「其它教材里最好的一条」来换位。
+
+    为什么需要：importance 是**全图**中心性（storage.graph_analysis 的度/介数/
+    特征向量加权），跨教材不可比——老书里被考烂的枢纽实体 6~8 分，新入库教材的
+    实体只有 0.8 分，top-8 于是被老书占满。锚点相关性（_node_relevance）只跟锚点
+    字面有关、与教材无关，能挡掉大部分情形；但锚点与节点名毫无字面重合时（整章
+    聚合、同义改写）相关性全为 0，排序只剩 importance，本配额就是那一层的兜底。
+
+    保守起见：``excluded``（锚点 1 跳直挂的实体）永不换出；换出的只能在**独占
+    教材自己的条目**里挑（否则会拿少数教材去换第三本教材，与「腾位置」的初衷
+    相反），且永远是其中排名最末的；换入条数不超过 top-N 的一半，同一本教材
+    最多占 1 个保留席位。
+
+    无论是否触发，返回值长度都固定为 ``max_per_kind``（不触发时就是普通截断）。
+    """
+    head_items = items[:max_per_kind]
+    if max_per_kind <= 1 or len(items) <= max_per_kind:
+        return head_items, []
+    head = [(it, _item_sources(it)) for it in head_items]
+    tail = [(it, _item_sources(it)) for it in items[max_per_kind:]]
+
+    # 触发条件：单本教材独占 top-N 的 >= _QUOTA_TRIGGER_SHARE 席位
+    counts: Dict[FrozenSet[str], int] = {}
+    for _it, src in head:
+        counts[src] = counts.get(src, 0) + 1
+    dom_src, dom_cnt = max(counts.items(), key=lambda kv: kv[1])
+    if not dom_src or dom_cnt < len(head) * _QUOTA_TRIGGER_SHARE:
+        return head_items, []
+
+    # 只从独占教材自己的（非 1 跳直挂）条目里腾位置：拿少数教材换第三本教材
+    # 既无多样性收益又损相关性，直接不动作。
+    evictable = [it for it, src in reversed(head)
+                 if src == dom_src and _item_key(it) not in excluded]
+    slots = min(_QUOTA_MAX_SLOTS, len(head) // 2, len(evictable))
+    if slots <= 0:
+        return head_items, []
+
+    head_ids: Set[str] = set()
+    for _it, src in head:
+        head_ids |= src
+    best_rel = max(_node_relevance(it, tokens) for it, _src in head)
+    floor = best_rel * _QUOTA_MIN_RATIO
+
+    picked: List[Any] = []
+    picked_ids: Set[str] = set()
+    for it, src in sorted(tail, key=lambda p: _item_rank(p[0], tokens), reverse=True):
+        if len(picked) >= slots:
+            break
+        if not src or src & head_ids or src & picked_ids:
+            continue        # 无来源信息 / 已在 top-N / 同一本书只占一个席位
+        if best_rel > 0 and _node_relevance(it, tokens) < floor:
+            continue        # 相关性远低于 top-N，不为多样性降质
+        picked.append(it)
+        picked_ids |= src
+    if not picked:
+        return head_items, []
+
+    evicted = {id(it) for it in evictable[:len(picked)]}
+    new_head = [it for it, _src in head if id(it) not in evicted] + picked
+    new_head.sort(key=lambda it: _item_rank(it, tokens), reverse=True)
+    return new_head, picked
 
 
 def _entity_payload(kind: str, key: str, nd: dict) -> dict:
@@ -421,7 +585,24 @@ class ScienceGraphStore:
 
         contained = [cand for cand in candidates if _near(cand)]
         if contained:
-            return max(contained, key=lambda c: difflib.SequenceMatcher(None, name, c).ratio())
+            # 取「与锚点字面重合最长」的候选，而不是 difflib 相似度最高者。difflib 比值
+            # = 2*重合/(len(锚点)+len(候选))，锚点一长就系统性偏向**短名**：锚点
+            # "二次函数动轴动区间题型" 会一直落到最大枢纽 "二次函数"，真正对题的具体
+            # 概念（"动轴动区间"）反而永远落选。
+            #
+            # 但只按最长公共子串排会走向另一个极端——把锚点吸附到更窄的节点上
+            # （"相似三角形问题" → "动点产生的相似三角形问题"）。故改用
+            # `重合字数 - 候选多出的字数`：只给**出现在锚点里**的字记功，候选名里
+            # 学生没提过的限定语（"动点产生的"）反而扣分。它同时满足两个方向——
+            # 既不退回短枢纽（5-0 > 4-0，选 "动轴动区间"），也不越过锚点去猜限定语
+            # （5-0 > 7-3，选 "相似三角形"）。
+            def _overlap_rank(c: str) -> Tuple[int, int, int]:
+                lcs = _lcs_len(name, c)
+                surplus = len(c) - lcs          # 候选名里锚点没提过的字数
+                return (lcs - surplus,          # 同分时取长度最接近锚点的候选
+                        -abs(len(c) - len(name)), len(c))
+
+            return max(contained, key=_overlap_rank)
 
         # 3) difflib 相似度兜底（覆盖同义改写等场景）
         best, best_ratio = None, 0.0
@@ -630,6 +811,8 @@ class ScienceGraphStore:
         concept_prereq: List[Any] = []     # nb -PREREQUISITE_OF-> ckey
         concept_followup: List[Any] = []   # ckey -PREREQUISITE_OF-> nb
         concept_related: List[Any] = []    # 概念间其它关系（含 REL_EXTRA / 自定义）
+        # 1 跳直挂实体键（kind -> 键集）：来源配额不可换出这些条目，只从下钻/2 跳里腾位置
+        direct_keys: Dict[str, Set[str]] = {}
         seen_keys: set = {ckey}
 
         for nb in self.graph.successors(ckey):        # 出边 ckey -> nb
@@ -646,6 +829,7 @@ class ScienceGraphStore:
                     concept_related.append((nb, nd, rel))
             elif t in _RETRIEVABLE:
                 hop_buckets[t].append((nb, nd))
+                direct_keys.setdefault(t, set()).add(nb)
 
         for nb in self.graph.predecessors(ckey):      # 入边 nb -> ckey
             if nb in seen_keys:
@@ -661,6 +845,7 @@ class ScienceGraphStore:
                     concept_related.append((nb, nd, rel))
             elif t in _RETRIEVABLE:
                 hop_buckets[t].append((nb, nd))
+                direct_keys.setdefault(t, set()).add(nb)
 
         # 概念级下钻：入口概念常常只是目标实体的"兄弟概念"（锚点 "18°三角函数"
         # 模糊解析到 "锐角三角函数"，而 18° 公式挂在兄弟概念 "特殊角的三角函数" 上）。
@@ -682,28 +867,38 @@ class ScienceGraphStore:
                     hop_buckets[K_EXAMPLE].append((ex_key, self.graph.nodes[ex_key]))
 
         # ---- 归类输出
-        def _capped(kind: str, items: List[Any]) -> List[Any]:
+        def _capped(kind: str, items: List[Any],
+                    excluded: Optional[Set[str]] = None) -> List[Any]:
             """按锚点相关性排序后再截断某类实体，命中枢纽概念时记 warning。
 
-            排序键 = (锚点 token 命中数, importance) 双降序：主键保住与提问
+            排序键 = (锚点相关性评分, importance) 双降序：主键保住与提问
             直接相关的实体（"18°三角函数" 之于 "18°角的正弦值"）；同分时按
             importance（结构分析写入的考点权重，见 storage.graph_analysis）
             降序，让枢纽概念截断到 top-N 时保留「被考最多的」而非
             「最先入库的」。锚点无 token 命中（如整章聚合）时 importance 升为
             主键，改为按考点权重输出。两者皆缺失/为零（未跑过 --stage analyze）
             时稳定排序保持原插入序，行为与旧版一致。
-            """
-            def _rank(it: Any) -> Tuple[int, float]:
-                imp = it[1].get("importance", 0) if isinstance(it, tuple) \
-                    else it.get("importance", 0)
-                return (_node_relevance(it, tokens), float(imp or 0))
 
+            截断时再过一道来源配额（_reserve_source_slots）：单本教材独占 top-N
+            时给其它教材保留席位；``excluded`` 是自身 1 跳直挂实体的键，配额
+            不会拿它们腾位置。
+            """
             tokens = _anchor_tokens(anchor_name)
-            items = sorted(items, key=_rank, reverse=True)
-            if max_per_kind is not None and len(items) > max_per_kind:
-                log.warning("[graph_store] %s 关联 %s 共 %d 条，截断至 top-%d",
-                            ckey, kind, len(items), max_per_kind)
-                return items[:max_per_kind]
+            items = sorted(items, key=lambda it: _item_rank(it, tokens), reverse=True)
+            if max_per_kind is None or len(items) <= max_per_kind:
+                return items
+            log.warning("[graph_store] %s 关联 %s 共 %d 条，截断至 top-%d",
+                        ckey, kind, len(items), max_per_kind)
+            items, promoted = _reserve_source_slots(
+                items, max_per_kind, tokens, excluded or set())
+            if promoted:
+                names = self.pdf_names()
+                books = "、".join(sorted(
+                    {names.get(s, s)
+                     for it in promoted for s in _item_sources(it)}))
+                log.warning("[graph_store] %s 的 %s 被单本教材独占 top-%d，"
+                            "为 %s 保留 %d 个席位（换出末位条目）",
+                            ckey, kind, max_per_kind, books, len(promoted))
             return items
 
         for key, nd in concept_prereq:
@@ -728,15 +923,17 @@ class ScienceGraphStore:
                 "sources": list(nd.get("sources", [])),
                 "page_refs": list(nd.get("page_refs", [])),
             })
-        for key, nd in _capped("formulas", hop_buckets[K_FORMULA]):
+        for key, nd in _capped("formulas", hop_buckets[K_FORMULA], direct_keys.get(K_FORMULA)):
             result["formulas"].append(_entity_payload(K_FORMULA, key, nd))
-        for key, nd in _capped("experiments", hop_buckets[K_EXPERIMENT]):
+        for key, nd in _capped("experiments", hop_buckets[K_EXPERIMENT],
+                               direct_keys.get(K_EXPERIMENT)):
             result["experiments"].append(_entity_payload(K_EXPERIMENT, key, nd))
-        for key, nd in _capped("question_types", hop_buckets[K_QUESTION_TYPE]):
+        for key, nd in _capped("question_types", hop_buckets[K_QUESTION_TYPE],
+                               direct_keys.get(K_QUESTION_TYPE)):
             result["question_types"].append(_entity_payload(K_QUESTION_TYPE, key, nd))
-        for key, nd in _capped("methods", hop_buckets[K_METHOD]):
+        for key, nd in _capped("methods", hop_buckets[K_METHOD], direct_keys.get(K_METHOD)):
             result["methods"].append(_entity_payload(K_METHOD, key, nd))
-        for key, nd in _capped("examples", hop_buckets[K_EXAMPLE]):
+        for key, nd in _capped("examples", hop_buckets[K_EXAMPLE], direct_keys.get(K_EXAMPLE)):
             result["examples"].append(_entity_payload(K_EXAMPLE, key, nd))
         return result
 

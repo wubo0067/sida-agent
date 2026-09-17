@@ -12,6 +12,9 @@ config.py 创建（不再直连 openai）：
   按提示词提取；
 - 每页结果独立落盘 output/pdf_extract/{pdf_id}/p{页码}.md，
   存在且非空即视为已提取，不再调用模型（断点续跑，中断不丢数据）；
+- 残页保护（页缓存一旦写入就只随 _EXTRACT_VERSION 失效，坏内容会被永久固化）：
+  端点报告 finish_reason 为 length/max_tokens 时按可重试失败处理，绝不返回残页；
+  输出短于 MIN_PAGE_CHARS 时同页重试一次，取更完整的一份（见 _has_suspected_truncation）；
 - pdf_id = PDF 文件内容的哈希前 16 位，与 extract_pdf 同算法，
   因此两个项目可共用同一份提取缓存目录。
 
@@ -63,6 +66,15 @@ OUTPUT_DIR = BASE_DIR / "output" / "pdf_extract"
 LLM_TIMEOUT = 300.0      # 单次请求超时（秒）
 LLM_RETRIES = 2          # 本地调用失败重试次数（指数退避）
 MAX_TOKENS = 8192        # 单次生成最大 token 数
+
+# 页输出字符数阈值：用于识别「疑似残页」（见 _has_suspected_truncation）。
+# 视觉模型偶发截断（思考 token 挤占 max_tokens）时会吐出一份不完整的页文本，
+# 直接落盘就会被永久固化——缓存只在 _EXTRACT_VERSION 变更时整体失效。
+# 阈值取自本仓 563 份页缓存的实测分布：纯封面/近空白页 30~51 字符（21 页，
+# 各讲首页），其余页最短 121 字符、中位数 1476 字符。故仅 (BLANK_PAGE_CHARS,
+# MIN_PAGE_CHARS) 开区间视为可疑：命中则用同一份 messages 同页重试一次。
+MIN_PAGE_CHARS = 600     # 正文字符数下限，低于此值即视为疑似截断
+BLANK_PAGE_CHARS = 120   # 低于此值视为封面/近空白页，正常接受、不重试
 
 # 手写批注（红笔小字、上下标）在 ~170dpi 下易糊，长边提到 3000px（A4 ≈ 257dpi）；
 # MAX_ZOOM 需同步放大，否则 A4（长边 842pt）会被 3.0x 截在 2526px 到不了 3000。
@@ -414,12 +426,83 @@ def _fix_math(text: str) -> str:
     )
 
 
+# 端点若以这些 finish_reason 收尾，说明输出被 max_tokens 截断，而非正常结束
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
+
+
+def _find_finish_reason(payload: Any, _depth: int = 0) -> str | None:
+    """从响应对象/元数据里尽力取出 finish_reason（各端点字段位置不一）。
+
+    只做有限深度遍历；取不到返回 None——「无法判断」绝不当作截断，
+    以免在不上报该字段的端点上把正常输出误判为失败。
+    """
+    if _depth > 4:
+        return None
+    if isinstance(payload, (list, tuple)):
+        children: list[Any] = list(payload)
+    elif isinstance(payload, dict):
+        value = payload.get("finish_reason")
+        if isinstance(value, str) and value:
+            return value.lower()
+        children = list(payload.values())
+    elif hasattr(payload, "response_metadata"):   # LangChain AIMessage / Generation 等
+        value = getattr(payload, "finish_reason", None)
+        if isinstance(value, str) and value:
+            return value.lower()
+        children = [getattr(payload, "response_metadata", None),
+                    getattr(payload, "generation_info", None)]
+    else:
+        return None
+    for child in children:
+        found = _find_finish_reason(child, _depth + 1)
+        if found:
+            return found
+    return None
+
+
+def _token_usage_brief(response: Any) -> str:
+    """把响应的 token 用量整理成一行可读文本（缺失项略过）。
+
+    单独暴露 reasoning_tokens 是刻意的：该端点把它计入 completion_tokens，
+    思考量一大就挤占 max_tokens 并把正文挤掉——这正是「残页」事故的主因。
+    """
+    meta = getattr(response, "response_metadata", None)
+    usage = dict(meta.get("token_usage") or {}) if isinstance(meta, dict) else {}
+    summary = getattr(response, "usage_metadata", None)
+    summary = summary if isinstance(summary, dict) else {}
+    details = usage.get("completion_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    out_details = summary.get("output_token_details")
+    out_details = out_details if isinstance(out_details, dict) else {}
+    pairs = (
+        ("prompt", usage.get("prompt_tokens", summary.get("input_tokens"))),
+        ("output", usage.get("completion_tokens", summary.get("output_tokens"))),
+        ("reasoning", details.get("reasoning_tokens", out_details.get("reasoning"))),
+    )
+    return ", ".join(f"{k}={v}" for k, v in pairs if v is not None) or "未知"
+
+
+def _has_suspected_truncation(content: str) -> bool:
+    """页文本是否短到「疑似截断」，需要同页重试一次。
+
+    只看 (BLANK_PAGE_CHARS, MIN_PAGE_CHARS) 开区间：封面/近空白页（各讲首页
+    只有一行标题，实测 30~51 字符）落在下界以内，属正常输出，对它重试纯属浪费
+    模型调用；而真正的正文页若只吐出百来字，几乎必然是截断（历史事故 321 字符）。
+    """
+    return BLANK_PAGE_CHARS < len(content) < MIN_PAGE_CHARS
+
+
 def _invoke_llm(llm: ChatOpenAI, messages: list[HumanMessage],
                 meter: Any | None = None) -> str:
     """调用视觉 LLM 并带指数退避重试，返回文本结果。
 
     meter 为可选的 TokenMeter 兼容对象（只需有 .add(response) 方法，
     见 main.TokenMeter），用于累计本次真实 token 消耗。
+
+    每次调用都记录 finish_reason 与 token 用量（含 reasoning_tokens）：
+    这两项缺失正是历史事故「日志里只有输出字符数、看不出截断」的根因。
+    端点若报告 finish_reason 为 length/max_tokens，说明正文被 max_tokens
+    截断，按可重试失败处理——残页绝不能返回给调用方、更不能写入页缓存。
     """
     last_error: Exception | None = None
     for attempt in range(LLM_RETRIES + 1):
@@ -430,10 +513,17 @@ def _invoke_llm(llm: ChatOpenAI, messages: list[HumanMessage],
                 meter.add(response)
             content = response.content
             text = content.strip() if isinstance(content, str) else str(content or "").strip()
+            finish = _find_finish_reason(response)
             log.debug(
-                "    LLM 响应：耗时 %.1fs，输出 %d 字符（第 %d/%d 次尝试）",
-                time.perf_counter() - started, len(text), attempt + 1, LLM_RETRIES + 1,
+                "    LLM 响应：耗时 %.1fs，输出 %d 字符，finish_reason=%s，tokens(%s)"
+                "（第 %d/%d 次尝试）",
+                time.perf_counter() - started, len(text), finish or "未上报",
+                _token_usage_brief(response), attempt + 1, LLM_RETRIES + 1,
             )
+            if finish in _TRUNCATED_FINISH_REASONS:
+                raise RuntimeError(
+                    f"输出被 max_tokens 截断（finish_reason={finish}，已输出 {len(text)} 字符）"
+                )
             return text
         except Exception as exc:  # noqa: BLE001
             last_error = exc
@@ -660,9 +750,22 @@ def extract_pdf_pages_as_markdown(
                     )
                 ]
                 log.info("  [提取] 第 %d 页 ...（缓存：%s）", page_no, page_file)
-                content = _invoke_llm(vision_llm, messages, meter=meter)
-                content = _fix_math(content)
+                content = _fix_math(_invoke_llm(vision_llm, messages, meter=meter))
                 new_calls += 1
+                if _has_suspected_truncation(content):
+                    # 视觉模型偶发截断：同页原样重试一次，取两次里更完整的一份。
+                    # 只重试一次——两次都短多半是页面本身稀疏，继续重试无益；此时
+                    # 仍按结果落盘（宁可留个可疑页也不丢页），但打警告便于人工复核。
+                    log.warning("  ! 第 %d 页：输出仅 %d 字符（<%d），疑似截断，同页重试一次",
+                                page_no, len(content), MIN_PAGE_CHARS)
+                    retry = _fix_math(_invoke_llm(vision_llm, messages, meter=meter))
+                    new_calls += 1
+                    if len(retry) > len(content):
+                        content = retry
+                    if _has_suspected_truncation(content):
+                        log.warning("  ! 第 %d 页：重试后仍仅 %d 字符，疑漏抽；"
+                                    "如确认缺失请删除该页缓存后重跑：%s",
+                                    page_no, len(content), page_file)
                 if content:
                     page_file.write_text(content, encoding="utf-8")
                 else:
