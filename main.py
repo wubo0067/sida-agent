@@ -255,8 +255,8 @@ def _run_analyze(args: argparse.Namespace) -> None:
     subjects = [args.subject]
     if not args.subject:
         subjects = sorted(
-            {nd.get("subject") for _nid, nd in graph_db.graph.nodes(data=True)
-             if nd.get("subject") and nd.get("subject") != "meta"
+            {str(nd["subject"]) for _nid, nd in graph_db.graph.nodes(data=True)
+             if nd.get("subject") and nd["subject"] != "meta"
              and nd.get("type") not in (K_SUBJECT, K_PDF_SOURCE)})
     if not subjects:
         log.warning("[main] 图谱中未发现任何学科实体，无可分析内容")
