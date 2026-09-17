@@ -26,9 +26,12 @@
     uv run python main.py --stage chat --list       # 只列会话清单
     uv run python main.py --stage chat --export s-xxxx # 把会话导出为 Markdown
     uv run python main.py --list-books              # 列出已导入的教材书名后退出
+    uv run python main.py --stage analyze           # 图谱结构分析（全部学科）
+    uv run python main.py --stage analyze --subject math  # 只分析数学
 --stage: all=提取+建库+问答（默认）；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；
         chat=多轮对话 REPL（内置 /new /export /session /list 等命令，Ctrl+C 退出，
-        会话历史按 thread_id 持久化到 output/chat/checkpoints.sqlite，超预算自动压缩进摘要）。
+        会话历史按 thread_id 持久化到 output/chat/checkpoints.sqlite，超预算自动压缩进摘要）；
+        analyze=图谱健康度审计+中心性/社区分析（不调模型，写回 importance/community 属性）。
 长文档：页码区间可以开很大（整本书），build_knowledge_bases 会按 --max-chars
 预算自动切子块增量抽取；建库前会先打印规模预估并请求确认（--yes 跳过）。
 --max-chunks 限制推理抽取侧每轮新子块数，--max-new-calls 限制视觉提取侧每轮新页数，
@@ -67,7 +70,8 @@ from ingestion import (
 from logger import get_logger
 from pdf_processor import (_load_cached_pages, _pdf_id,
                            extract_pdf_pages_as_markdown)
-from storage.graph_store import ScienceGraphStore
+from storage.graph_analysis import analyze_graph
+from storage.graph_store import K_PDF_SOURCE, K_SUBJECT, ScienceGraphStore
 from storage.image_store import relativize_image_paths
 from storage.vector_store import get_vector_store
 
@@ -100,10 +104,13 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--stage", choices=("all", "build", "ask", "chat", "serve"), default="all",
+        "--stage", choices=("all", "build", "ask", "chat", "serve", "analyze"),
+        default="all",
         help="all=提取+建库+问答；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；"
              "chat=多轮对话（会话历史持久化，可 --session 续聊）；"
-             "serve=启动 FastAPI HTTP 服务（books/ask/chat/build 接口 + SSE 流式）。",
+             "serve=启动 FastAPI HTTP 服务（books/ask/chat/build 接口 + SSE 流式）；"
+             "analyze=对已持久化图谱做结构分析（健康度审计+中心性/社区，写回 "
+             "importance/community 属性），不触碰向量库、不调用任何模型。",
     )
     parser.add_argument("--host", default="127.0.0.1",
                         help="serve：HTTP 监听地址（对外提供服务用 0.0.0.0）。")
@@ -120,10 +127,11 @@ def parse_args() -> argparse.Namespace:
                         help="起始页码（从 1 计）。")
     parser.add_argument("--end-page", type=int, default=DEFAULT_END_PAGE,
                         help="结束页码（含），超出总页数自动截断。")
-    parser.add_argument("--subject", type=_subject_choice, default=DEFAULT_SUBJECT,
+    parser.add_argument("--subject", type=_subject_choice, default=None,
                         choices=("physics", "chemistry", "math"),
                         help="学科，仅限三种：physics/物理、chemistry/化学、math/数学"
-                             "（接受中文或拼音别名，自动归一化）。")
+                             "（接受中文或拼音别名，自动归一化）。build/ask 缺省为"
+                             " physics；analyze 缺省为图谱内全部学科。")
     parser.add_argument("--query", default=DEFAULT_QUERY,
                         help="学生提问（ask/all 阶段使用）。")
     # ---- chat 模式专属参数 ----
@@ -231,6 +239,32 @@ def _print_books() -> None:
     log.info("[main] 已导入教材（共 %d 本）:", len(names))
     for pdf_id, name in sorted(names.items(), key=lambda kv: (kv[1], kv[0])):
         log.info("  《%s》 (%s)", name or "（未命名）", pdf_id)
+
+
+def _run_analyze(args: argparse.Namespace) -> None:
+    """--stage analyze：对已持久化图谱做结构分析（功能1+2），只读图谱文件。
+
+    不指定 --subject 时自动发现图谱里实际存在的全部学科（排除 meta 注册表
+    与 Subject 汇总节点）逐科分析；分析结果（importance/community 属性）
+    随每科 graph_db.save() 落盘，问答侧 _capped 排序即刻生效。
+    """
+    graph_db = ScienceGraphStore.load()
+    if graph_db.graph.number_of_nodes() == 0:
+        log.warning("[main] 图谱库为空，请先执行 --stage build 建库")
+        return
+    subjects = [args.subject]
+    if not args.subject:
+        subjects = sorted(
+            {nd.get("subject") for _nid, nd in graph_db.graph.nodes(data=True)
+             if nd.get("subject") and nd.get("subject") != "meta"
+             and nd.get("type") not in (K_SUBJECT, K_PDF_SOURCE)})
+    if not subjects:
+        log.warning("[main] 图谱中未发现任何学科实体，无可分析内容")
+        return
+    for subj in subjects:
+        analyze_graph(graph_db, subj, save=True)
+    log.info("[main] 结构分析完成（学科: %s），importance/community 属性已持久化",
+             ", ".join(subjects))
 
 
 def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> None:
@@ -538,6 +572,13 @@ def main() -> None:
     if args.list_books:
         _print_books()
         return
+    if args.stage == "analyze":
+        # 结构分析只读图谱 JSON、不调模型：跳过向量库与 PDF 参数校验
+        _run_analyze(args)
+        return
+    # 其余阶段沿用默认学科（--subject 缺省 None 仅供 analyze 区分"全部学科"）
+    if args.subject is None:
+        args.subject = DEFAULT_SUBJECT
     if args.chat_list:
         _print_sessions()
         return

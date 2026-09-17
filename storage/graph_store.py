@@ -685,13 +685,21 @@ class ScienceGraphStore:
         def _capped(kind: str, items: List[Any]) -> List[Any]:
             """按锚点相关性排序后再截断某类实体，命中枢纽概念时记 warning。
 
-            排序键 = 与锚点 token 的命中数（降序，稳定）：枢纽概念截断到 top-N 时，
-            先保住与提问直接相关的实体（"18°三角函数" 之于 "18°角的正弦值"），
-            再按原顺序保留其余。锚点无 token 命中（如整章聚合）时退化为原截断行为。
+            排序键 = (锚点 token 命中数, importance) 双降序：主键保住与提问
+            直接相关的实体（"18°三角函数" 之于 "18°角的正弦值"）；同分时按
+            importance（结构分析写入的考点权重，见 storage.graph_analysis）
+            降序，让枢纽概念截断到 top-N 时保留「被考最多的」而非
+            「最先入库的」。锚点无 token 命中（如整章聚合）时 importance 升为
+            主键，改为按考点权重输出。两者皆缺失/为零（未跑过 --stage analyze）
+            时稳定排序保持原插入序，行为与旧版一致。
             """
+            def _rank(it: Any) -> Tuple[int, float]:
+                imp = it[1].get("importance", 0) if isinstance(it, tuple) \
+                    else it.get("importance", 0)
+                return (_node_relevance(it, tokens), float(imp or 0))
+
             tokens = _anchor_tokens(anchor_name)
-            if tokens:
-                items = sorted(items, key=lambda it: -_node_relevance(it, tokens))
+            items = sorted(items, key=_rank, reverse=True)
             if max_per_kind is not None and len(items) > max_per_kind:
                 log.warning("[graph_store] %s 关联 %s 共 %d 条，截断至 top-%d",
                             ckey, kind, len(items), max_per_kind)

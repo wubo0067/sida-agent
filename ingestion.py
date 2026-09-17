@@ -53,6 +53,7 @@ from langchain_core.documents import Document
 
 from config import get_reasoning_llm
 from logger import get_logger
+from storage.graph_analysis import analyze_graph
 from storage.graph_store import (
     K_CONCEPT,
     K_EXAMPLE,
@@ -1306,6 +1307,12 @@ def build_knowledge_bases(
 
     # 构建后审计：暴露空壳概念节点（幽灵节点）；审计放整轮结束后，避免逐块刷屏
     _audit_graph(graph_db, subject)
+    # 结构分析（功能1健康度审计 + 功能2中心性/社区）：为节点写入 importance/
+    # community 属性，随下方统一落盘持久化；任何异常只记日志，绝不中断建库。
+    try:
+        analyze_graph(graph_db, subject)
+    except Exception:
+        log.exception("[ingestion] 图谱结构分析失败（不影响已建数据），跳过")
     # 兜底落盘：覆盖 max_chunks 提前退出等路径
     with _maybe_lock(graph_lock):
         graph_db.save()
