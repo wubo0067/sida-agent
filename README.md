@@ -178,8 +178,8 @@ uv run python main.py --stage build --pdf "L:/vivi/初三/物理/9S合并PDF-完
 问答与建库进度均支持 **SSE 流式**。启动：
 
 ```powershell
-uv run python main.py --stage serve --host 127.0.0.1 --port 8000
-# 打开交互式文档 http://127.0.0.1:8000/docs （OpenAPI / Swagger）
+uv run python main.py --stage serve --host 127.0.0.1 --port 6173
+# 打开交互式文档 http://127.0.0.1:6173/docs （OpenAPI / Swagger）
 ```
 
 启动时 `lifespan` 一次性加载双库（图谱 + 向量）与线程池、build 执行器；所有业务代码为同步
@@ -225,7 +225,7 @@ SSE 帧格式：每帧 `data: <json>\n\n`，流结束追加 `event: end\ndata: {
 > 若中文请求体出现乱码，先执行 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`。
 
 ```powershell
-$base = "http://127.0.0.1:8000"
+$base = "http://127.0.0.1:6173"
 
 # ---- 基础 ----
 # 存活检查
@@ -301,7 +301,7 @@ curl.exe -N -sS "$base/build/tasks/<task_id>/events?since=0"
 | `--max-new-calls` | int（metavar N） | `None` | 本次视觉提取最多新调用 N 次（已缓存页不占额度），达上限即停、重跑续跑（控视觉模型成本） |
 | `--yes` | flag | `False` | 跳过建库前的规模预估确认（脚本 / 夜间批量自动放行） |
 | `--host` | str | `127.0.0.1` | serve：HTTP 监听地址 |
-| `--port` | int | `8000` | serve：HTTP 监听端口 |
+| `--port` | int | `6173` | serve：HTTP 监听端口 |
 | `--reload` | flag | `False` | serve：代码热重载（开发用，uvicorn reload） |
 
 > `--list` / `--export` 在 `main()` 里**先于 `--stage` 分发**处理，命中即执行并退出。

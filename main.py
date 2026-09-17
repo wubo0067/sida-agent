@@ -107,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--host", default="127.0.0.1",
                         help="serve：HTTP 监听地址（对外提供服务用 0.0.0.0）。")
-    parser.add_argument("--port", type=int, default=8000,
+    parser.add_argument("--port", type=int, default=6173,
                         help="serve：HTTP 监听端口。")
     parser.add_argument("--reload", action="store_true",
                         help="serve：开发模式热重载（改代码自动重启，勿用于生产）。")
