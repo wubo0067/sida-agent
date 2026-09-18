@@ -22,7 +22,9 @@ from agent.state import CircuitAgentState
 from config import get_reasoning_llm
 from logger import get_logger
 from storage.graph_store import (
+    K_CONCEPT,
     K_EXAMPLE,
+    K_FORMULA,
     K_METHOD,
     K_QUESTION_TYPE,
     ScienceGraphStore,
@@ -365,9 +367,24 @@ def create_circuit_agent(
         concept = state.get("target_concept") or ""
         _t0 = time.perf_counter()
         log.debug("[workflow.graph_traversal] 图谱聚合检索, subject=%s, concept=%s", subject, concept)
-        # 第一级：按概念名直接做 1~2 跳聚合检索（get_subgraph 内部还有一次模糊解析，
-        # 返回的 dict 里 concept 为 None 即表示图谱里根本没有这个概念节点）
-        subgraph = graph_db.get_subgraph(subject, concept)
+        # 实体锚点优先：锚点不是概念名、但精确等于某公式/题型/方法/例题名时（如提问
+        # 「角元塞瓦定理」，图谱里真有同名 Formula 节点），必须先走实体锚点聚合。
+        # 否则 get_subgraph 内部的模糊解析会把锚点吸附到「相近但错误」的概念（模糊
+        # 解析到「塞瓦定理」），真实内容挂在另一概念下永远不可达，而下方第二级实体
+        # 兜底又因 concept 非 None 永远不会执行（角元塞瓦事故链，README 6.14）。
+        subgraph = None
+        if concept and node_key(subject, K_CONCEPT, concept) not in graph_db.graph:
+            if any(node_key(subject, kind, concept) in graph_db.graph
+                   for kind in (K_FORMULA, K_QUESTION_TYPE, K_METHOD, K_EXAMPLE)):
+                entity_sub = graph_db.get_entity_subgraph(subject, concept)
+                if entity_sub is not None:
+                    log.warning("[workflow.graph_traversal] 锚点 %r 非概念但精确命中实体名，"
+                                "改走实体锚点聚合", concept)
+                    subgraph = entity_sub
+        if subgraph is None:
+            # 第一级：按概念名直接做 1~2 跳聚合检索（get_subgraph 内部还有一次模糊解析，
+            # 返回的 dict 里 concept 为 None 即表示图谱里根本没有这个概念节点）
+            subgraph = graph_db.get_subgraph(subject, concept)
         if subgraph.get("concept") is None:
             # 第二级兜底——非概念实体锚点：意图 LLM 给出的 concept 可能不是概念名，
             # 而是公式名/题型名/方法名（如问"三角函数的倍角公式"，锚点其实是公式）。

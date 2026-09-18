@@ -937,6 +937,56 @@ main.py --stage chat
 
 ---
 
+### 6.14 「name：定义摘要」概念名污染与三层修复（`ingestion.py` + `agent/workflow.py` + 迁移脚本）
+
+**事故现象**：提问「请介绍角元塞瓦定理」，知识库明明已抽取过该页
+（`output/pdf_extract/f7ff5074c6215ee7/p0006_v2.md` 与配图俱在），回答却称
+「未收录」。根因是一条被污染的长句概念节点。
+
+**根因链**：
+
+1. 旧版 `_gather_known_context` 把已建概念拼成单串 `f"{name}：{desc[:40]}"`
+   注入滚动上下文；
+2. prompt 又要求「已列出的概念名必须逐字复用」，模型于是把整串
+   `塞瓦定理：在三角形内任取一点，连接该点与三个顶点……则这`（40+ 字）
+   当成**概念名**输出，图谱落下这个长句 Concept 节点；
+3. 角元/边元塞瓦公式、`塞瓦定理的应用` 题型、先修边全部挂在这个长句节点下，
+   与正主 `math:Concept:塞瓦定理` 割裂；
+4. 检索时锚点 `角元塞瓦定理` 经 `get_subgraph` 模糊匹配（包含式）命中**正主**
+   `塞瓦定理` 子树——那里没有角元公式；而 `graph_traversal` 的实体锚点兜底
+   只在 `concept is None` 时才触发，此时 concept 非 None，兜底永不执行；
+5. 生成侧只拿到正主子树的原文，诚实地回答「未收录」。
+
+**三层修复**：
+
+- **抽取层根治（`ingestion.py`）**：
+  - `_build_context_block` / `_gather_known_context` 改为把概念渲染成
+    `- 「{name}」（定义摘要：{desc}）`，名字与摘要分离，并明确指示模型
+    「只复用「」内的名字，勿把摘要并入名字」；`_gather_known_context`
+    返回值由 `List[str]` 改为 `List[Tuple[str, str]]`（name, desc）。
+  - 新增防御性还原 `_restore_polluted_names(data, names)`：抽取结果里任何
+    实体名/关系端点若含冒号、且冒号前缀精确等于已知概念名，则截断还原为前缀。
+    在两批抽取（`_extract_chunk_data`）与**缓存命中回放**（build 循环 `else`
+    分支）处都调用，使旧脏缓存在重跑时也被清洗。
+
+- **检索层防御（`agent/workflow.py`）**：`graph_traversal_node` 在一级
+  `get_subgraph`（模糊概念解析）**之前**插入实体锚点优先判断——当锚点名在图谱里
+  精确对应某个 Formula/QuestionType/Method/Example（而非 Concept）节点时，
+  直接走 `get_entity_subgraph` 精确展开，避免被模糊匹配拉进同名概念的割裂子树。
+
+- **数据层修复（`migrate_merge_polluted_concepts.py`，零 LLM、幂等）**：
+  扫描全库 Concept 节点，凡「冒号前缀精确等于同科另一概念名」者判为污染节点，
+  调 `ScienceGraphStore.merge_concepts` 把边与属性按「越建越全」并入正主，
+  删除污染节点；向量库同步删除污染切片、把其正文（去首行旧标题）追加进正主
+  切片后按原 id 重写；最后对受影响学科重跑 `analyze_graph` 刷新
+  importance/community。实测一次性合并 99 个污染节点（同型缺陷遍布两科，
+  角元塞瓦只是被触发的一个），图谱 3695→3596 节点，零残留。
+
+**复盘要点**：网络 `nx.DiGraph.has_edge(u, v, x)` 第三参是属性 **key** 而非值，
+手写边去重易踩坑——合并节点应复用既有 `merge_concepts`，不要手搓图手术。
+
+---
+
 ## 7. 已知局限 / 待优化项
 
 以下均来自本次代码走查读到的实际实现边界，非推测：

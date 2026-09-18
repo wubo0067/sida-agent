@@ -454,7 +454,7 @@ def _extract_json(llm: Any, prompt: str, label: str, max_attempts: int = 2,
 
 
 def _build_context_block(label: str, chapters: List[str],
-                         known_concepts: List[str]) -> str:
+                         known_concepts: List[Tuple[str, str]]) -> str:
     """滚动上下文注入块：全书已有章节 + 已建相关概念。
 
     增量建库时每次只喂一个子块，模型看不到此前抽过什么；不注入已知信息就会
@@ -468,10 +468,13 @@ def _build_context_block(label: str, chapters: List[str],
             "下列标题，严禁另开新章；下列之外的本章新章节按原文正常新建）】\n"
             + "\n".join(f"- {t}" for t in chapters))
     if known_concepts:
+        lines = "\n".join(
+            f'- 「{n}」（定义摘要：{d}）' if d else f'- 「{n}」'
+            for n, d in known_concepts)
         parts.append(
-            "【已建库的相关概念（若本批文本出现的是同一概念，name 必须逐字复用下列名称，"
-            "严禁另起同义新名；未列出的新概念按原文标准名词正常新建）】\n"
-            + "\n".join(f"- {c}" for c in known_concepts))
+            "【已建库的相关概念（若本批文本出现的是同一概念，name 必须逐字复用下列「」内的"
+            "概念名本身，严禁另起同义新名；「」后的定义摘要只用于帮你辨认是否同一概念，"
+            "绝不可把它并入 name。未列出的新概念按原文标准名词正常新建）】\n" + lines)
     if not parts:
         return ""
     return "\n\n" + "\n\n".join(parts) + "\n"
@@ -479,7 +482,7 @@ def _build_context_block(label: str, chapters: List[str],
 
 def _build_knowledge_prompt(subject: str, markdown: str,
                             chapters: Optional[List[str]] = None,
-                            known_concepts: Optional[List[str]] = None) -> str:
+                            known_concepts: Optional[List[Tuple[str, str]]] = None) -> str:
     """第一批：知识体系（章节/概念/公式/实验/方法）抽取提示词。
 
     chapters / known_concepts 为滚动上下文（见 _gather_known_context），
@@ -539,7 +542,7 @@ def _build_knowledge_prompt(subject: str, markdown: str,
 
 def _build_question_prompt(subject: str, markdown: str, concept_names: List[str],
                            chapters: Optional[List[str]] = None,
-                           known_concepts: Optional[List[str]] = None) -> str:
+                           known_concepts: Optional[List[Tuple[str, str]]] = None) -> str:
     """第二批：题型与例题抽取提示词（注入第一批概念名，保证引用一致、原文不回抄）。
 
     chapters / known_concepts 为滚动上下文（同 _build_knowledge_prompt），
@@ -1069,15 +1072,17 @@ def _build_page_docs(subject: str, pages_data: List[Dict[str, Any]], *,
 def _gather_known_context(vector_db: Chroma, graph_db: ScienceGraphStore,
                           subject: str, chunk_markdown: str,
                           top_k: int = _KNOWN_CONTEXT_TOP_K
-                          ) -> Tuple[List[str], List[str]]:
-    """滚动上下文：返回 (已建章节标题列表, 已建相关概念摘要列表)。
+                          ) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """滚动上下文：返回 (已建章节标题列表, 已建相关概念 (名称, 描述) 列表)。
 
     增量建库时模型只能看到当前子块，看不到此前建过的内容；这两个列表让 LLM
     「记得」全书已建章节与相关概念，解决跨子块命名不一致 / 章节重复开章问题：
     - 章节：轻量全量（graph_db 里该学科所有 Chapter 节点 title），全书量级小；
     - 相关概念：用当前子块前 2000 字符去向量库做相似度检索（限定 subject +
       Concept），只取 top_k 条 name + 一句话描述，控制 prompt 体积不随全书
-      概念总数线性增长。
+      概念总数线性增长。名称与描述必须以二元组分开携带、由 _build_context_block
+      以「概念名 + 括号内定义摘要」的排版注入，绝不能拼成 "name：desc" 单串
+      （见 _build_context_block 的历史教训注释）。
     """
     chapters: List[str] = sorted({
         nd.get("title") or bare_name(key)
@@ -1085,7 +1090,7 @@ def _gather_known_context(vector_db: Chroma, graph_db: ScienceGraphStore,
         if nd.get("subject") == subject and nd.get("type") == "Chapter"
     })[:_KNOWN_CONTEXT_CHAPTERS_CAP]
 
-    concepts: List[str] = []
+    concepts: List[Tuple[str, str]] = []
     query = chunk_markdown[:2000].strip()
     if query and vector_db is not None:
         try:
@@ -1106,8 +1111,61 @@ def _gather_known_context(vector_db: Chroma, graph_db: ScienceGraphStore,
                 continue
             body_lines = (h.page_content or "").splitlines()
             desc = body_lines[1].strip() if len(body_lines) > 1 else ""
-            concepts.append(f"{name}：{desc[:40]}" if desc else name)
+            # 名称与描述分开返回，绝不拼成 "name：desc"。历史教训：拼接串会被模型
+            # 当成完整概念名「逐字复用」，导致图谱里出现 40+ 字的长句节点名，
+            # 其挂载的公式/题型在检索侧永远无法通过锚点解析命中（见 README 6.14）。
+            concepts.append((name, desc[:40]))
     return chapters, concepts
+
+
+# 概念名里出现「名称：描述」形态时的分隔符（中英文冒号都挡）。
+_NAME_POLLUTION_RE = re.compile("[:：]")
+
+
+def _restore_polluted_names(data: Dict[str, Any], names: Set[str]) -> None:
+    """把被模型误当实体名的「已知名：定义摘要」拼接串还原为裸名（就地改）。
+
+    历史事故：旧版滚动上下文把已建概念拼成 "name：desc[:40]" 单串注入，模型按
+    「逐字复用」指令把整串当成概念名输出，图谱里落下 40+ 字的长句节点，其挂载
+    的公式/题型在检索侧永远锚点不中（角元塞瓦定理事故，README 6.14）。上下文
+    格式已修（_gather_known_context），这里再叠一道防御：任何 name 引用字段若形
+    如「已知裸名 + 冒号 + 多余文本」，剪回裸名。前缀必须精确等于某条已知概念名
+    才动手，正常名称（含合法冒号但前缀不是已知概念）原样保留，不会误伤。
+    对新抽取（传入滚动上下文名）与旧抽取缓存命中（传入图谱已建概念名）两条
+    路径都生效，无需清缓存重建。
+    """
+    if not names:
+        return
+
+    def fix(v: Any) -> Any:
+        if not isinstance(v, str):
+            return v
+        m = _NAME_POLLUTION_RE.search(v)
+        if not m:
+            return v
+        prefix = v[:m.start()].strip()
+        if prefix in names and prefix != v.strip():
+            log.info("[ingestion] 概念名被还原（拼入了定义摘要）: %r -> %r", v, prefix)
+            return prefix
+        return v
+
+    for kind in _ENTITY_KINDS:
+        for it in data.get(kind) or []:
+            if not isinstance(it, dict):
+                continue
+            if kind == "chapters":
+                continue  # 章节标题不是概念引用，不剪
+            if kind == "extra_relations":
+                for f in ("from", "to"):
+                    if it.get(f):
+                        it[f] = fix(it[f])
+                continue
+            if it.get("name"):
+                it["name"] = fix(it["name"])
+            for f in ("prerequisites", "related_concepts"):
+                refs = it.get(f)
+                if isinstance(refs, list):
+                    it[f] = [fix(r) for r in refs]
 
 
 def _extract_chunk_data(subject: str, md: str, label: str,
@@ -1127,11 +1185,13 @@ def _extract_chunk_data(subject: str, md: str, label: str,
     k_data = _extract_json(
         llm, _build_knowledge_prompt(subject, md, chapters, concepts),
         f"{label}·知识体系", meter=meter)
+    _restore_polluted_names(k_data, {n for n, _d in concepts})
     concept_names = [c.get("name", "").strip()
                      for c in k_data.get("concepts", []) if c.get("name", "").strip()]
     q_data = _extract_json(
         llm, _build_question_prompt(subject, md, concept_names, chapters, concepts),
         f"{label}·题型例题", meter=meter)
+    _restore_polluted_names(q_data, {n for n, _d in concepts} | set(concept_names))
     return {**k_data, **q_data}
 
 
@@ -1294,6 +1354,11 @@ def build_knowledge_bases(
             _emit_progress(progress, {"stage": "extract", "event": "chunk_start",
                                       "chunk": idx, "total_chunks": len(chunks),
                                       "label": label, "cached": True})
+            # 旧版滚动上下文留下的「name：desc」污染名可能已固化在缓存里：写库前
+            # 按图谱已建概念名统一还原（见 _restore_polluted_names 注释）。
+            _restore_polluted_names(data, {
+                bare_name(nid) for nid, nd in graph_db.graph.nodes(data=True)
+                if nd.get("subject") == subject and nd.get("type") == K_CONCEPT})
         with _maybe_lock(graph_lock):
             # _persist_chunk 内含「写图 + save」，整段即临界区（向量库
             # add_documents 由 Chroma 自身并发保护，不必额外串行化）
