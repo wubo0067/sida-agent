@@ -25,6 +25,8 @@ class _AgentStateOptional(TypedDict, total=False):
     search_text: Optional[str]       # find_problem 时提炼出的题目内容特征文本
     graph_context: Dict[str, Any]    # 图谱检索出的教研上下文（概念拆解/公式/实验/题型/例题）
     vector_chunks: List[str]        # 向量库回表拿出的原题全文
+    fallback_chunks: List[str]      # 图谱全空时向量库兜底召回的教材页切片（含出处头，见 6.16）
+    fallback_images: List[Dict[str, Any]]  # 兜底页切片的图片引用 [{"pdf_id":…, "page":…}]
     problem_chunks: List[str]       # find_problem 时向量语义检索命中的讲义页切片（含出处头）
     problem_images: List[Dict[str, Any]]  # find_problem 命中页的图片引用 [{"pdf_id":…, "page":…}]
     final_answer: str               # 最终生成的系统讲解

@@ -505,7 +505,7 @@ LangGraph 状态机（`create_circuit_agent` 编译），节点：
 - **`analyze_intent`**：一次低温短输出 LLM 调用（`temperature=0.0`、`max_tokens=128`、关思考），
   判定 `{subject, intent, concept, search_text}`；`intent` 三选一 `concept`/`find_problem`/`offtopic`。
   解析用 `_parse_intent`（非标准 JSON 时退回正则提取字段；任何回退到 `physics` 都记 warning）。
-- **`graph_traversal`（concept 链路）四级兜底**：
+- **`graph_traversal`（concept 链路）五级兜底**：
   1. 概念名直接命中 → `get_subgraph` 做 1~2 跳聚合（`_resolve_concept` 内部还有一次
      去教学尾缀 → 双向包含 → `difflib≥0.6` 的模糊解析；并从兄弟概念下钻一层挂载实体、
      各桶按锚点相关性排序后截断，见 6.9）；
@@ -519,11 +519,16 @@ LangGraph 状态机（`create_circuit_agent` 编译），节点：
      阶段一按提问原文在 1 跳邻居概念里挑字面命中的内容枢纽重定向；无命中则阶段二用
      `resolve_chapter`（剥教学语气词 + 章节主题词互含判定）做**整章聚合**
      `get_chapter_subgraph` 兜底。
+  5. **前四级全空**（`_graph_context_empty` 为真）→ 换检索通道：在向量库的教材 **Page 切片域内**
+     做语义召回，把教材原文直接下发给 `generate_response`（`fallback_chunks` / `fallback_images`）。
+     这是 2026-09-20 尿素案例后新增的一级：图谱全空不再等于「教材未收录」，因为**抽取层漏掉**
+     的页原文一直躺在向量库里。判据 `_graph_context_empty` 由「是否兜底」与「是否拒答」共用，
+     详见 **「6.16 图谱全空时的教材原文语义兜底」**。
 - **`fetch_chunks`**：按命中例题的 `(pdf_id, page)` 组向量键 `subject:Page:{pdf_id}:{页码}`，
   用 `vector_db.get(where={"id": pk})` 精确回表取讲义页原文；未命中记 warning，
   缺 `page` 的例题不拿空壳冒充原文。
 - **`generate_response`**：把图谱上下文（概念拆解 / 公式 / 实验 / 题型 / 方法 / 先修 / 后续）
-  与回表原文拼进提示词，强约束「每个知识点必须能在六个区块里找到出处，资料没有的写
+  与回表原文、向量兜底原文拼进提示词，强约束「每个知识点必须能在七个区块里找到出处，资料没有的写
   『当前教材资料未收录』」，流式生成。图谱每类关联实体默认截断 top `_DEFAULT_MAX_PER_KIND=8`
   防 prompt 膨胀；截断前先按锚点 token 相关性排序，与提问直接相关的实体不被截掉
   （见日志「关联 examples 共 94 条，截断至 top-8」，机制见 6.9）。
@@ -537,8 +542,9 @@ LangGraph 状态机（`create_circuit_agent` 编译），节点：
   这是**应用层确定性拼接**，不交给模型生成——同 `_fix_math` 折叠 LaTeX 定界符的理由一样，
   让模型写字面语法不可靠。图片只进 `final_answer`，不进 `messages`，机制见 6.13。
   concept 链路用 `refs_from_graph_context(g_ctx)` 汇总（例题页 + 各实体节点的
-  `page_refs`，按优先级取前 `MAX_IMAGES_PER_ANSWER=6` 张），find_problem 链路用本轮
-  `problem_images`（元数据比对方式见 6.13）。
+  `page_refs`，按优先级取前 `MAX_IMAGES_PER_ANSWER=6` 张），图谱未命中时再并上
+  兜底召回页的引用（`fallback_images`，见 6.16），重复页只保留第一次出现；
+  find_problem 链路用本轮 `problem_images`（元数据比对方式见 6.13）。
 - **`respond_chitchat`（offtopic）**：不触发任何检索，一两句轻量回应并引导回学习。
 
 ### 6.8 实体锚点解析与集合名词同族展开（`storage/graph_store.py`）
@@ -1061,6 +1067,78 @@ main.py --stage chat
 `output/pdf_images/{pdf_id}/`，都是**不可逆**的破坏性操作，需配 `--dry-run` + 时间戳备份 + 逐步校验，
 另行设计（当前只做非破坏性的 1~3 层：分组、展示、当前版本指定）。
 
+### 6.16 图谱全空时的教材原文语义兜底（`agent/workflow.py` + `agent/state.py`）
+
+**症状**（2026-09-20 实测，化学「如何制作尿素[CO(NH2)2]」）：教材里明明有完整内容，回答却是
+「当前教材资料未收录」。这是**最坏的一类失败**——它不是答错，而是把已收录的知识判成未收录，
+用户既拿不到答案，也拿不到「去补哪本书」的线索。
+
+**根因不在检索参数，而在抽取层的覆盖空洞**。逐级排查结论：
+
+| 环节 | 实测结果 |
+|---|---|
+| 图谱有没有「尿素」概念 | 没有。全图仅 2 个含「尿素」的 Formula：`合成尿素`(→p18)、`氨合成尿素`(→p21) |
+| 关键页有没有进库 | **进了**：p131（【例16】「空气→N₂→NH₃→合成尿素」流程图）在向量库里有 `chemistry:Page:f66ebe8a0d63cfe8:131` 切片，正文 2200 字符 |
+| 该页抽成了什么 | 覆盖 p130–132 的抽取块只产出通用实体（`Concept:二氧化碳的性质与用途`、`QuestionType:工业流程与物质转化`），「尿素」仅作为**描述里的一个词**出现在 breakdown / identify_features 中，未生成可检索实体 |
+| 概念入口 | `get_subgraph("chemistry","尿素的制备"/"尿素")` → `concept=None`，各桶全 0 |
+| 实体入口 | `get_entity_subgraph` 对 `尿素的制备`/`工业制尿素`/`如何制作尿素` 全部 `None`；对 `合成尿素`/`合成氨尿素` 正常返回——**差的就是那个名字** |
+| 模糊兜底 | `difflib` 最高分 0.462（`尿素的制备` vs `Concept:氧气的性质与制备`）／0.667（`尿素` vs `Formula:合成尿素`），均远低于实体阈值 0.8（长锚点是系统性欠分，见 6.9） |
+| 章节兜底 | `resolve_chapter("chemistry","如何制作尿素[CO(NH2)2]")` → `None`；另一种问法错命中 `第六讲 元素` |
+
+四档全部落空 → 触发拒答。而正确的那一页，在向量库里按距离排**第一名**：
+
+| 查询（限定 `subject=chemistry` 且 `type=Page`） | 距离 | 目标页 |
+|---|---|---|
+| `如何制作尿素[CO(NH2)2]` | 0.7465 | **p131** |
+| `制作尿素的流程是什么，需要哪些化学元素参与` | 0.8353 | **p131** |
+| `尿素` | 1.0312 | **p131** |
+| `工业制尿素` | 0.8956 | **p131** |
+
+**所以缺的不是数据，是一条通道**：图谱四档全空时，把向量库里的教材原文捞出来交给生成节点。
+
+**实现**：
+
+- `agent/state.py` 新增两个字段：`fallback_chunks: List[str]`（含出处头的教材页切片文本）、
+  `fallback_images: List[Dict[str, Any]]`（`{"pdf_id", "page"}` 引用）。
+- `_graph_context_empty(graph_ctx) -> bool`：**唯一**的「图谱有没有命中」判据——只看
+  `concept` / `concepts` / `formulas` / `experiments` / `question_types` / `methods` / `examples`
+  七桶，`prerequisites` / `follow_ups` 不算命中（它们只有名字，撑不起作答）。
+  该函数被 `graph_traversal`（是否启用兜底）与 `generate_response`（是否拒答）**共用**，
+  保证两个口径永远一致——否则会出现「兜底拉了原文、生成节点仍按未命中拒答」的静默失效。
+- `_semantic_page_fallback(vector_db, pdf_names, subject, query, concept)`：模块级函数
+  （**刻意不做成闭包**，好让这条链路能在零 LLM 调用下被探针和单测直接驱动）。
+  在 `{"$and": [{"subject": …, "type": "Page"}]}` 域内 `similarity_search_with_score`，
+  取 `k=8` 候选 → 丢掉 `<100` 字符的页 → 取前 3 → 用 `pdf_names()` 把 `pdf_id` 换成书名，
+  把页首 `--- 第 N 页 ---` 改写成 `--- 第 N 页（《教材名》） ---`（解析层标出处时模型有书名可用）。
+- **只在 Page 切片里检索**，不混入实体切片。两个理由：页切片带 `pdf_id` + `page`，命中即可标出处、
+  配教材原图；实体切片的内容与图谱重叠且噪声更大——实测「如何制作尿素」的实体命中里夹着
+  `第11次课小测-3` 这类无关例题，把它们的原文当资料下发只会稀释信噪比。
+- **刻意不做相似度重排**（对比 6.7 中找题链路的 `_bigram_overlap` 重排）：找题场景的检索文本是题面
+  描述，二元组重合是强信号；兜底面对的是知识点提问，重合度普遍很低（实测含答案的自然语句与页面的
+  重合多在 0.1~0.3 且彼此交错），重排只会把噪声页推上来。上表已证明「取前 3」在 4 种问法下都命中目标页。
+- 过短页（封面 / 各讲首页 30~51 字符）按 `_VECTOR_FALLBACK_MIN_CHARS=100` 丢弃：
+  这类页几乎必然出现在短问句的 top-k 里，下发只会占满 prompt 预算却零信息。
+- 短问句（原话 < `_VECTOR_FALLBACK_MIN_QUERY_CHARS=6` 字符，如「那第二题呢」）改用意图锚点
+  `concept` 检索，避免代词式追问把兜底也带偏。
+- `generate_response` 的提示词从**六区块**扩到**七区块**，新增
+  `【教材原文片段（知识图谱未命中，向量库语义召回）】`；输出规范里明确写上
+  「本区块属**教材已收录内容**，有内容必须作答并按 `--- 第 N 页（《教材名》） ---` 标出处，
+  不得因图谱未命中就输出未收录」，把拒答条件收紧为「图谱未命中 **且** 教材原文语义召回为空」。
+- 图片引用合并：图谱引用在前、兜底引用在后并去重（两条路径理论互斥，兜底仅在图谱全空时启用，
+  合并只是防御性写法）。
+
+**日志**：`[workflow.fallback]` 前缀，包含检索文本、候选数、耗时（含 embedding 调用）三条 info；
+`graph_traversal` 侧在兜底命中 / 未命中时各打一条 warning，明确区分
+「图谱四档全空但已用教材原文作答」与「图谱四档全空且兜底也空，本轮按未收录作答」。
+
+**边界与代价**：兜底是**降级通道而非等价替换**——它按语义召回的页给原文，溯源粒度是「整页」，
+不像图谱路径能精确指到某个公式 / 题型；且多一次 embedding 调用（LLM 调用次数不变）。
+治本方案（抽取层修复）见 7.5。
+
+**测试**：`tests/test_vector_fallback.py` 覆盖 `_graph_context_empty`、`_tag_page_header`、
+`_fallback_query_text`、`_select_fallback_pages`、`_semantic_page_fallback`（含 filter 形状、短页过滤、
+`k=8`、书名标注、异常吞掉）。运行：`python -m unittest tests.test_vector_fallback`。
+
 ---
 
 ## 7. 已知局限 / 待优化项
@@ -1094,6 +1172,9 @@ main.py --stage chat
   可能与预估不同，最终应以运行结束时的实际统计为准。
 - **旧抽取库可能没有 `page_refs`**：v4 之前生成的实体缺少页码引用，概念、公式、实验、题型和方法
   可能无法挂教材原图。需要重跑抽取层的 `build`；视觉页缓存不受影响。
+- **抽取层可能整体漏掉半页内容**：工业流程 / 背景流程页可能只被抽成通用实体，产品名仅作为描述里的
+  一个词出现，图谱里没有可检索入口。当前由 6.16 的向量兜底拓住（能答，但溯源粒度只到整页），
+  治本方案见 7.5。
 
 ### 7.3 图片与存储限制
 
@@ -1112,10 +1193,10 @@ main.py --stage chat
   `FileNotFoundError`，应在部署环境显式传入路径或改为配置项。
 - **迁移脚本包含历史 `pdf_id`**：`migrate_book_sources.py` 硬编码两个历史 PDF ID 到教材名，
   是一次性迁移脚本，不适合作为通用数据迁移工具。
-- **自动化测试覆盖仍很薄**：`tests/` 下只有 `test_ingestion.py` 与 `test_book_versions.py` 两个
-  模块级用例集，且 `tests/` 没有 `__init__.py`（必须 `python -m unittest tests.<模块>`，
-  `unittest discover` 会报 `Start directory is not importable`），没有 CI 与冒烟脚本，
-  其余正确性主要依赖日志、人工核对和定向验证。
+- **自动化测试覆盖仍很薄**：`tests/` 下只有 `test_ingestion.py`、`test_book_versions.py` 与
+  `test_vector_fallback.py` 三个模块级用例集，且 `tests/` 没有 `__init__.py`（必须
+  `python -m unittest tests.<模块>`，`unittest discover` 会报 `Start directory is not importable`），
+  没有 CI 与冒烟脚本，其余正确性主要依赖日志、人工核对和定向验证。
 - **教材版本删除缺位**：目前只能分组展示与指定当前版本，清理旧版本（图谱 / 向量库 / 图片）
   属破坏性操作，尚未实现（见 6.15）。
 - **README 的 Embedding 示例不完全一致**：安装示例和 `.env` 示例应使用同一个模型；端口则可能
@@ -1126,6 +1207,35 @@ main.py --stage chat
 缓存版本号 `_EXTRACT_VERSION`（视觉页缓存）与 `_EXTRACT_SCHEMA_VERSION`（抽取结果缓存）分别管理
 两层缓存，当前不同步是有意的职责划分，不属于待确认问题；修改抽取 schema 时仍需按 6.4 的规则
 单独递增抽取版本。
+
+### 7.5 抽取层局限：工业流程 / 背景流程页可能不产出可检索实体（方案 C，待实施）
+
+**现象与定位**：见 6.16 的尿素案例。教材第 131 页的「空气 → N₂ → NH₃ → 合成尿素」流程图，
+抽取层只给出通用实体（`Concept:二氧化碳的性质与用途`、`QuestionType:工业流程与物质转化`），
+产品名「尿素」仅作为描述里的一个词出现。于是图谱里**没有任何以产品命名的入口**，
+四档检索逐级落空，明明收录在教材里的内容被判为「未收录」。
+
+6.16 的向量兜底把症状从「答不出」降级为「答得出、但溯源粒度只到整页」——
+以 `合成尿素` / `氨合成尿素` 为锚点的提问仍能命中图谱实体，可享受公式 / 题型的精确溯源；
+而 `尿素的制备` / `工业制尿素` 这类改写只能走兜底。根因（数据本身缺一个入口）没有修。
+
+**方案 C（待实施）**：抽取 prompt 增加硬约束，要求「**工业流程 / 背景流程题必须以流程的最终产品或
+核心产物命名**产出实体」（如 `合成尿素` 作为 Formula，通用题型 `工业流程与物质转化` 保留），
+并把流程图所在页登记进该实体的 `page_refs`。等价于把「人会在教材里怎么找这段」的命名习惯
+前置给抽取模型。同时需避免描述性字段（如 `QuestionType.identify_features`）成为唯一落点，
+否则依旧只会得到通用实体。
+
+**代价（为什么不现在做）**：改 prompt 必须递增 `ingestion._EXTRACT_SCHEMA_VERSION`
+（规则见 6.4），随之**全部抽取缓存 key 失效 → 推理模型整本重抽**；视觉页缓存 `_EXTRACT_VERSION`
+不受影响，不必重跑视觉层。当前登记 21 个版本，全量重抽的推理调用成本与耗时都不小，
+重抽后还要按 4.3 重跑 `build`、按 6.6 复核审计报告。故留到下一次「需要整体重建」时
+与其它抽取层改动一并执行。
+
+**验收方式**：重抽后 `get_entity_subgraph("chemistry", "合成尿素")` 命中且 `page_refs` 覆盖 p131；
+`如何制作尿素` 提问走图谱路径（日志不再出现 `[workflow.fallback]`）。
+
+**风险**：产品命名口径若不统一（`合成尿素` / `尿素` / `工业制尿素`），会引入新的同族名词问题，
+需与 6.8 的集合名词同族展开一同考虑，或让 prompt 同时输出常见别名。
 
 ---
 

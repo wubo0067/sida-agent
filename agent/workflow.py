@@ -12,7 +12,7 @@ import json
 import re
 import time
 import uuid
-from typing import Any, List, Optional
+from typing import Any, Iterable, List, Optional, Tuple
 
 from langchain_chroma import Chroma
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage
@@ -31,6 +31,7 @@ from storage.graph_store import (
     node_key,
 )
 from storage.image_store import (
+    normalize_refs,
     refs_from_graph_context,
     refs_from_metadatas,
     render_image_section,
@@ -61,6 +62,15 @@ _CHAT_SUMMARY_MAX_TOKENS = 600        # 单次摘要输出 token 上限
 _SEARCH_PROBLEM_TOP_K = 3
 _SEARCH_PROBLEM_RERANK_K = 10
 
+# ---- 图谱全空时的「教材原文语义兜底」预算（见 6.16） ----------------------
+# 抽取层可能整体漏掉某页内容（该页没被抽成任何可检索实体），此时图谱三级降级全空，
+# 但向量库里那一页的原文切片一直都在。兜底直接在 Page 切片域内做语义召回，把命中页
+# 原文交给生成节点，避免「知识在教材里、却答未收录」。
+_VECTOR_FALLBACK_TOP_K = 3           # 最终下发的页切片数（单页可达数千字符，不宜多）
+_VECTOR_FALLBACK_CANDIDATES = 8      # 先取候选、再过滤短页的候选数
+_VECTOR_FALLBACK_MIN_CHARS = 100     # 过短页切片（封面/各讲首页，实测 30~51 字符）丢弃
+_VECTOR_FALLBACK_MIN_QUERY_CHARS = 6  # 原话短于此长度（代词式追问）时改用意图锚点检索
+
 
 def _bigram_overlap(query: str, page: str) -> float:
     """query 的相邻字符二元组在 page 中出现的比例（0~1）。
@@ -76,6 +86,122 @@ def _bigram_overlap(query: str, page: str) -> float:
         return 0.0
     hit = sum(1 for g in grams if g in page)
     return hit / len(grams)
+
+
+def _graph_context_empty(graph_ctx: Any) -> bool:
+    """图谱上下文是否完全为空（锚点概念 + 五个实体桶全无内容）。
+
+    「图谱命中」判据必须覆盖全部实体桶：非概念锚点（公式/题型/方法/例题）命中时
+    ``concept``/``concepts`` 恒为空，只看这两个会把命中误报成未命中，模型随即按
+    输出规范第 6 条拒答（问「三角函数的倍角公式」即踩此坑）。
+
+    本判据同时被两处消费——generate_response 决定「是否拒答」、graph_traversal 决定
+    「是否启用向量兜底」——两处口径必须严格一致，否则会出现「兜底不回答案」或
+    「有兜底内容仍拒答」的错配，故抽成单一实现。
+    """
+    if not isinstance(graph_ctx, dict):
+        return True
+    return not (graph_ctx.get("concept") or graph_ctx.get("concepts")
+                or graph_ctx.get("formulas") or graph_ctx.get("experiments")
+                or graph_ctx.get("question_types") or graph_ctx.get("methods")
+                or graph_ctx.get("examples"))
+
+
+def _tag_page_header(chunk: str, book: Optional[str] = None) -> str:
+    """把讲义页切片头「--- 第 N 页 ---」补成含书名的「--- 第 N 页（《教材名》） ---」。
+
+    书名未知（切片缺 pdf_id / 教材未登记 / 同页对应多本教材）时原样返回，让模型
+    回退到「（见教材第 X 页）」这类不带书名的标注（见 6.7 输出规范第 6 条）。
+    """
+    if not book:
+        return chunk
+    m = re.search(r"--- 第 (\d+) 页 ---", chunk)
+    if not m:
+        return chunk
+    return chunk.replace(m.group(0), f"--- 第 {m.group(1)} 页（《{book}》） ---", 1)
+
+
+def _fallback_query_text(query: str, concept: str) -> str:
+    """向量兜底用什么文本检索：学生原话优先，原话过短时改用意图锚点。
+
+    兜底问的是「教材里哪段文字与提问相近」，学生原话（含科目术语与题干片段）
+    信息量最大；只有代词式追问（「那第二题呢」）才需要借助锚点补全语义，
+    否则原话本身几乎检索不到任何东西。
+    """
+    query = (query or "").strip()
+    if len(query) >= _VECTOR_FALLBACK_MIN_QUERY_CHARS:
+        return query
+    return (concept or "").strip() or query
+
+
+def _select_fallback_pages(hits: Iterable[Any]) -> List[Any]:
+    """从 (Document, 距离) 命中列表里挑出可下发的教材页切片（保序、跳短页、限数）。
+
+    向量兜底刻意**不做相似度重排**（对比 search_problems 的 `_bigram_overlap` 重排）：
+    找题场景的检索文本是题面描述，二元组重合是有意义的强信号；兜底面对的是知识点
+    提问，重合度普遍很低（实测含答案的自然语句与页面的重合多在 0.1~0.3 之间且彼此
+    交错），重排只会把噪声页推上来。实测（尿素案例）Page 域内 4 种问法下目标页
+    131 全部按距离排第 1，「取前 k」已经够用。
+    """
+    picked: List[Any] = []
+    for item in hits or []:
+        doc = item[0] if isinstance(item, (tuple, list)) else item
+        text = (getattr(doc, "page_content", "") or "").strip()
+        if len(text) < _VECTOR_FALLBACK_MIN_CHARS:
+            continue
+        picked.append(doc)
+        if len(picked) >= _VECTOR_FALLBACK_TOP_K:
+            break
+    return picked
+
+
+def _semantic_page_fallback(vector_db: Any, pdf_names: Any, subject: str,
+                           query: str, concept: str) -> Tuple[List[str], List[Any]]:
+    """图谱全空时的第四级兜底：在教材 Page 切片域内做语义召回（见 6.16）。
+
+    动机（2026-09-20 尿素案例）：抽取层可能整体漏掉半页内容——第 131 页
+    「空气→N₂→NH₃→合成尿素」流程图只被抽成通用工业流程 / 二氧化碳性质实体，
+    图谱里没有任何以「尿素」命名的可检索实体，而向量库里该页原文切片一直在。
+    旧链路图谱空集即直接触发 generate_response 的「未收录」规则，缺的正是这条通道。
+
+    只在 Page 切片里检索、不混入实体切片，两个理由：
+    1. 页切片带 ``pdf_id`` + ``page`` 元数据，命中后能标出处、能配教材原图；
+    2. 实体切片的内容与图谱重叠，且检索噪声更大——实测「如何制作尿素」的实体命中
+       里夹着「第11次课小测-3」这类无关例题，把它们的原文当资料下发只会稀释信噪比。
+
+    做成模块级函数（而非 create_circuit_agent 内的闭包）是为了让它能在**零 LLM 调用**
+    下被探针与单元测试直接驱动——兜底逻辑的回归验证不该依赖推理模型。
+
+    返回 (页切片文本列表, 图片引用列表)；无可用命中时返回 ([], [])，由上层照旧拒答。
+    """
+    text = _fallback_query_text(query, concept)
+    if vector_db is None or not text:
+        log.info("[workflow.fallback] 向量兜底跳过：无检索文本或向量库不可用")
+        return [], []
+    # filter 顶层多字段 AND 必须显式 $and，否则 Chroma 抛
+    # "Expected where to have exactly one operator"（同 search_problems_node）。
+    # 注：类型标成裸 dict —— Chroma 的类型存根把 filter 声明为 dict[str, str]，
+    # $and 的 list 值会被判成类型错误（同 search_problems_node 的写法）。
+    where: dict = {"$and": [{"subject": subject}, {"type": "Page"}]}
+    try:
+        _t0 = time.perf_counter()
+        hits = vector_db.similarity_search_with_score(
+            text, k=_VECTOR_FALLBACK_CANDIDATES, filter=where)
+        log.info("[workflow.fallback] 向量兜底检索 %r 返回 %d 候选, 耗时 %.2fs"
+                 "（含 embedding 调用）", text[:40], len(hits), time.perf_counter() - _t0)
+    except Exception:  # noqa: BLE001
+        log.warning("[workflow.fallback] 向量兜底检索失败", exc_info=True)
+        return [], []
+    docs = _select_fallback_pages(hits)
+    if not docs:
+        log.info("[workflow.fallback] 候选均被短页过滤或命中为空，放弃兜底")
+        return [], []
+    chunks: List[str] = []
+    for doc in docs:
+        meta = doc.metadata or {}
+        book = (pdf_names or {}).get(str(meta.get("pdf_id") or ""))
+        chunks.append(_tag_page_header((doc.page_content or "").strip(), book))
+    return chunks, refs_from_metadatas(doc.metadata for doc in docs)
 
 
 def _parse_intent(raw: str) -> tuple[str, str, str, str]:
@@ -452,7 +578,28 @@ def create_circuit_agent(
                  len(subgraph.get("formulas", [])), len(subgraph.get("experiments", [])),
                  len(subgraph.get("question_types", [])), len(subgraph.get("methods", [])),
                  len(subgraph.get("examples", [])), time.perf_counter() - _t0)
-        return {"graph_context": subgraph}
+        # 第四级兜底——教材原文语义召回：上面三级降级（概念入口 → 实体锚点 → 题型/方法/
+        # 例题反查）+ 空壳重定位/章节兜底**全部落空**，说明抽取层没把该提问对应的内容抽成
+        # 任何可检索实体；但教材原文本身可能一直躺在向量库里（Page 切片）。此时若不放行
+        # 这条通道，generate_response 会按「图谱未命中 + 讲义原文无」的规则直接拒答，
+        # 对外表现为「教材里明明有、回答却说未收录」（见 6.16 尿素案例）。
+        # 兜底只在图谱彻底空集时启用，图谱命中时完全不触发，不影响既有链路的成本与行为。
+        fallback_chunks: List[str] = []
+        fallback_images: List[Any] = []
+        if _graph_context_empty(subgraph):
+            fallback_chunks, fallback_images = _semantic_page_fallback(
+                vector_db, graph_db.pdf_names(), subject,
+                state.get("query") or "", concept)
+            if fallback_chunks:
+                log.warning("[workflow.graph_traversal] 图谱四档降级全空，向量兜底召回教材页切片 "
+                            "%d 条（图片引用 %d 个），转由 generate_response 依据教材原文作答",
+                            len(fallback_chunks), len(fallback_images))
+            else:
+                log.warning("[workflow.graph_traversal] 图谱四档降级全空，向量兜底也未召回可用"
+                            "教材页切片，本轮将按「教材未收录」作答")
+        return {"graph_context": subgraph,
+                "fallback_chunks": fallback_chunks,
+                "fallback_images": fallback_images}
 
     def fetch_chunks_node(state: CircuitAgentState):
         g_ctx = state.get("graph_context", {})
@@ -734,13 +881,16 @@ def create_circuit_agent(
                     page_books[pg].append(nm)
 
         def _tag_chunk(c: str) -> str:
-            """把讲义页切片头「--- 第 N 页 ---」补成含书名的出处标记。"""
+            """把讲义页切片头「--- 第 N 页 ---」补成含书名的出处标记。
+
+            只在「该页确实只对应一本已登记教材」时补书名——同页码在多本教材里都有内容
+            时，补任一书名都是错的（会归错出处）。
+            """
             m = re.search(r"--- 第 (\d+) 页 ---", c)
             if m:
                 bs = page_books.get(int(m.group(1)))
                 if bs and len(bs) == 1:
-                    return c.replace(
-                        m.group(0), f"--- 第 {m.group(1)} 页（《{bs[0]}》） ---", 1)
+                    return _tag_page_header(c, bs[0])
             return c
 
         examples_text = "\n\n".join(_tag_chunk(c) for c in chunks)
@@ -758,15 +908,16 @@ def create_circuit_agent(
                 orig_label = "第 " + "、".join(map(str, pages_hit)) + " 页"
         else:
             orig_label = "无"
-        # "图谱命中"判据必须覆盖全部实体桶：非概念锚点（公式/题型/方法/例题）
-        # 命中时 concept/concepts 恒为空，若只看这两个会把命中误报成"未命中"，
-        # 模型随即按输出规范第 6 条拒答（问"三角函数的倍角公式"即踩此坑）。
-        graph_hit = bool(concept or concepts or g_ctx.get("formulas")
-                         or g_ctx.get("experiments") or g_ctx.get("question_types")
-                         or g_ctx.get("methods") or g_ctx.get("examples"))
+        # "图谱命中"判据必须覆盖全部实体桶（见 _graph_context_empty）：非概念锚点
+        # （公式/题型/方法/例题）命中时 concept/concepts 恒为空，若只看这两个会把命中
+        # 误报成"未命中"，模型随即按输出规范第 6 条拒答（问"三角函数的倍角公式"即踩此坑）。
+        graph_hit = not _graph_context_empty(g_ctx)
+        # 向量兜底原文（图谱四档降级全空时的第四级召回，见 graph_traversal / 6.16）
+        fallback_text = "\n\n".join(state.get("fallback_chunks") or [])
         retrieval_status = (
             f"知识图谱：{'命中' if graph_hit else '未命中'}；"
-            f"讲义原文：{orig_label}"
+            f"讲义原文：{orig_label}；"
+            f"教材原文语义召回：{'命中' if fallback_text else '无'}"
         )
 
         background_block = ("【对话背景（此前交流，供理解指代与衔接）】：\n"
@@ -775,11 +926,11 @@ def create_circuit_agent(
 {background_block}
 【最高优先级约束·严格依据资料】：
 本次回答的每一个知识点、公式、例题、结论，都必须能在下方【知识点定位】【公式与推导】
-【实验与图解】【题型模板与陷阱】【方法套路】【典型例题原文】六个区块中找到出处。
+【实验与图解】【题型模板与陷阱】【方法套路】【典型例题原文】【教材原文片段】七个区块中找到出处。
 你的任务是把这些检索资料整理、归纳、组织成条理清晰的讲解，而不是自由讲题：
 - 严禁引入资料之外的任何知识点、公式、题型、拓展或"常见补充"；
 - 资料没有的内容，直接写明"当前教材资料未收录该部分内容"，不要猜测或补全；
-- 若六个区块全部为空或"暂无"，只输出一句说明（见输出规范第 6 条），不要展开作答。
+- 若七个区块全部为空或"暂无"，只输出一句说明（见输出规范第 6 条），不要展开作答。
 - 在满足以上前提下尽量精炼：能一句话说清的不展开成三段，避免重复表述。
 
 {guide}
@@ -805,6 +956,9 @@ def create_circuit_agent(
 【典型例题原文（向量库回表）】：
 {examples_text or "暂无关联例题"}
 
+【教材原文片段（知识图谱未命中，向量库语义召回）】：
+{fallback_text or "无"}
+
 【本次检索命中情况】：{retrieval_status}
 
 【输出规范】：
@@ -825,9 +979,15 @@ def create_circuit_agent(
    - 不得出现无出处的内容；不得编造区块中不存在的书名或页码；确实需要提示资料局限时，
      另起一段以「【资料说明·教材未涉及】」
      开头，只说明"该部分内容当前教材未收录"，不要补充具体知识；
-   - 当检索命中情况显示图谱"未命中"且讲义原文为"无"时，不要作答，只输出一句：
+   - 【教材原文片段】区块是图谱"未命中"时的**兼底通道**：它直接取自教材页面原文，
+     属于教材**已收录**的内容（只是未被知识图谱抽成实体）。该区块有实际内容时，
+     必须基于其原文作答，句末按该段头部「--- 第 N 页（《教材名》） ---」标注
+     「（见《教材名》第 X 页）」（无书名时写「（见教材第 X 页）」），
+     不得因为图谱"未命中"就输出"未收录"；它没有「收录教材」标记，不适用"图谱收录"写法。
+   - 只有当检索命中情况显示图谱"未命中"、教材原文语义召回也为"无"（即【典型例题原文】
+     与【教材原文片段】均无内容）时，才不要作答，只输出一句：
      「当前教材资料未收录与该提问相关的知识点，无法基于教材作答。」
-   - 图谱"命中"即表示上述六个区块中至少有一个含实际内容：此时必须基于这些区块
+   - 图谱"命中"即表示上述七个区块中至少有一个含实际内容：此时必须基于这些区块
      作答，不得因为【知识点定位】为空（提问锚点是公式/题型名而非概念名时属正常）
      就判定为未收录；讲义原文为"无"时，图谱内容仍按上述"图谱收录"规则标注（有
      收录教材信息则带上《教材名》），只是不得引用具体页码；宁可说明不确定，
@@ -835,10 +995,10 @@ def create_circuit_agent(
 """
         log.info(
             "[workflow.generate_response] 提示词组装完成: %d 字符（概念块 %d/公式 %d/实验 %d/"
-            "题型 %d/方法 %d/例题原文 %d 字符）",
+            "题型 %d/方法 %d/例题原文 %d/兜底原文 %d 字符）",
             len(final_prompt), len(concept_block), len(formula_block),
             len(experiment_block), len(qtype_block), len(method_block),
-            len(examples_text))
+            len(examples_text), len(fallback_text))
         response = _stream_answer(answer_llm, final_prompt, label="generate_response")
         log.info("[workflow.generate_response] 解答生成完成, 长度=%d 字符", len(response))
         # 教材原图：按本轮命中的 (pdf_id, 页码) 确定性追加到回答末尾。页码有两路来源，
@@ -846,11 +1006,17 @@ def create_circuit_agent(
         # 实验、公式、题型/方法，最后相邻概念）：搜题路径取命中页切片的出处，概念/公式/实验
         # 讲解路径取图谱节点的 page_refs（见 ingestion._write_graph → 节点属性）。未落盘的
         # 图片被 render_image_section 过滤，故未补图的教材不产死链、也不占配额。
+        # 向量兜底路径的图片引用紧随图谱之后——两条路径互斥（兜底只在图谱全空时启用），
+        # 同时出现时说明图谱命中但缺页码，此时以图谱引用优先，符合"答即所问"原则。
         _g_refs = refs_from_graph_context(g_ctx)
+        _f_refs = normalize_refs(state.get("fallback_images") or [])
+        _all_refs = _g_refs + [r for r in _f_refs if r not in _g_refs]
         _t_img = time.perf_counter()
-        image_section = render_image_section(_g_refs)
-        log.info("[workflow.generate_response] 教材原图区块: 引用 %d 个 -> %d 字符, 耗时 %.3fs",
-                 len(_g_refs), len(image_section), time.perf_counter() - _t_img)
+        image_section = render_image_section(_all_refs)
+        log.info("[workflow.generate_response] 教材原图区块: 引用 %d 个（图谱 %d / 向量兜底 %d）"
+                 " -> %d 字符, 耗时 %.3fs",
+                 len(_all_refs), len(_g_refs), len(_f_refs), len(image_section),
+                 time.perf_counter() - _t_img)
         # final_answer 供单轮 ask/all 复用（main 保存 md）；AIMessage 供
         # chat 模式把回答写回 messages 会话历史（由 checkpointer 持久化）。
         # 原图区块只进 final_answer，理由同 generate_problem_response_node。
