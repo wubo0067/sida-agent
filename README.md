@@ -113,7 +113,7 @@ REASONING_API_KEY=sk-xxxx
 
 # Embedding（向量库，本地 Ollama）
 EMBEDDING_BASE_URL=http://localhost:11434
-EMBEDDING_MODEL=nomic-embed-text:latest
+EMBEDDING_MODEL=qwen3-embedding:latest
 ```
 
 > `config.py` 用 `load_dotenv` 读取，**同名系统环境变量优先于 `.env`**。Ollama 直连时

@@ -39,6 +39,17 @@ function Ok([string]$m) { Write-Host "    $m" -ForegroundColor Green }
 function Warn([string]$m) { Write-Host "    [warn] $m" -ForegroundColor Yellow }
 function Fail([string]$m) { Write-Host "    [error] $m" -ForegroundColor Red }
 
+# ---------- 启动字符画 ----------
+$Banner = @'
+   _     _                                    _
+  ___(_) __| | __ _        __ _  __ _  ___ _ __ | |_
+ / __| |/ _` |/ _` |_____ / _` |/ _` |/ _ \ '_ \| __|
+ \__ \ | (_| | (_| |_____| (_| | (_| |  __/ | | | |_
+ |___/_|\__,_|\__,_|      \__,_|\__, |\___|_| |_|\__|
+                                |___/
+'@
+function Show-Banner { Write-Host ''; $Banner -split "`r?`n" | ForEach-Object { Write-Host "    $_" -ForegroundColor Magenta }; Write-Host '' }
+
 $HelpText = @'
 sida-agent 一键启动脚本（PowerShell）
 
@@ -72,9 +83,12 @@ sida-agent 一键启动脚本（PowerShell）
 
 # ---------- 0. 帮助 / 无参数 ----------
 if (-not $Command -or $Command -in 'help', '-h', '--help') {
+    Show-Banner
     Write-Host $HelpText
     exit 0
 }
+
+Show-Banner
 
 # ---------- 1. 前置检查 ----------
 $UvCmd = Get-Command uv -ErrorAction SilentlyContinue
