@@ -17,13 +17,33 @@ Subject = Literal["physics", "chemistry", "math"]
 
 
 # ---- /books ----
-class BookItem(BaseModel):
+class BookVersion(BaseModel):
+    """教材的一个内容版本（pdf_id = PDF 内容哈希，改版即新 id）。"""
+
     pdf_id: str
+    name: str = ""
+    is_active: Optional[bool] = Field(
+        None, description="是否被显式指定为当前版本；None=未表述（老数据）")
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class BookItem(BaseModel):
+    """一本「逻辑书」（同名多版本聚合成一条，前端不再看到同名重复项）。"""
+
+    logical_book_id: str = Field(..., description="逻辑书 id（同名归一化，可由 --book-id 指定）")
     name: str
+    version_count: int = Field(1, description="已导入的内容版本数")
+    active_pdf_id: Optional[str] = Field(
+        None,
+        description="当前版本；多版本且未显式指定时为 null（不猜，需 set-active 指定）",
+    )
+    versions: List[BookVersion] = Field(default_factory=list)
 
 
 class BookList(BaseModel):
-    count: int
+    count: int = Field(..., description="逻辑书（教材）数量")
+    version_count: int = Field(0, description="登记的全部版本数（pdf_id 条数）")
     books: List[BookItem]
 
 
@@ -123,7 +143,12 @@ class EstimateResult(BaseModel):
 
 class BuildRequest(EstimateRequest):
     book: Optional[str] = Field(None, description="教材显示名，同 CLI --book")
+    book_id: Optional[str] = Field(
+        None, alias="bookId",
+        description="逻辑书 id（同名多版本聚合用），同 CLI --book-id；缺省由 book 派生")
     max_chunks: Optional[int] = Field(None, alias="maxChunks")
+    save_every_chunks: int = Field(10, ge=1, alias="saveEveryChunks",
+                                  description="每 N 个子块保存一次图谱快照")
     confirm: bool = Field(
         True, description="false 且存在新调用时不启动，仅回 409 让调用方看预估")
 

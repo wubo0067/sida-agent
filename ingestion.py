@@ -44,6 +44,7 @@ import difflib
 import hashlib
 import json
 import re
+from datetime import datetime
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -60,6 +61,7 @@ from storage.graph_store import (
     K_EXPERIMENT,
     K_FORMULA,
     K_METHOD,
+    K_PDF_SOURCE,
     K_QUESTION_TYPE,
     K_SUBJECT,
     REL_EXEMPLIFIED_BY,
@@ -72,6 +74,8 @@ from storage.graph_store import (
     REL_TRACES_TO,
     ScienceGraphStore,
     bare_name,
+    logical_book_id,
+    node_book_id,
     node_key,
 )
 from storage.vector_store import get_vector_store
@@ -177,6 +181,8 @@ def _repair_json_escapes(text: str) -> str:
 _EXTRACT_SCHEMA_VERSION = "v4"
 # 抽取结果缓存目录（按输入哈希落盘，相同输入二次构建直接跳过 LLM）
 _CACHE_DIR = Path(__file__).resolve().parent / "output" / "extract_cache"
+_BUILD_STATE_PATH = Path(__file__).resolve().parent / "output" / "build_state.json"
+_DUP_AUDIT_MAX_CONCEPTS = 2000
 
 # 知识抽取单子块字符预算：整本教材按预算自动切成若干子块，每次只把一个
 # 子块的 Markdown 交给推理 LLM（两批串行），避免单次输入/输出超上下文。
@@ -196,6 +202,30 @@ _DUP_CONCEPT_RATIO = 0.82
 # 「保留更长一份」合并；其余列表字段（breakdown / common_mistakes / traps /
 # sources 等无序要点集合）才做 union 去重合并。
 _SEQUENCE_FIELDS = frozenset({"derivation", "template", "steps"})
+
+
+def _normalize_source_page(value: Any, label: str) -> Optional[int]:
+    """把例题出处页码归一化为单个正整数；非法值返回 None。"""
+    if isinstance(value, bool):
+        log.warning("[ingestion] %s 的 source.page 非法，已忽略: %r", label, value)
+        return None
+    if isinstance(value, int):
+        page = value
+    elif isinstance(value, float) and value.is_integer():
+        page = int(value)
+    elif isinstance(value, str):
+        match = re.fullmatch(r"\s*[Pp]?\s*(\d+)\s*", value)
+        if not match:
+            log.warning("[ingestion] %s 的 source.page 非法，已忽略: %r", label, value)
+            return None
+        page = int(match.group(1))
+    else:
+        log.warning("[ingestion] %s 的 source.page 类型非法，已忽略: %r", label, value)
+        return None
+    if not _PAGE_MIN <= page <= _PAGE_MAX:
+        log.warning("[ingestion] %s 的 source.page 超出范围，已忽略: %r", label, value)
+        return None
+    return page
 
 
 def _cache_key(subject: str, full_markdown: str) -> str:
@@ -228,6 +258,35 @@ def _save_extract_cache(key: str, data: Dict[str, Any]) -> None:
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as e:
         log.warning("[ingestion] 抽取缓存写入失败: %s", e)
+
+
+def _load_build_state() -> Dict[str, Any]:
+    """读取 chunk 写入状态；状态损坏时从空状态开始，不阻断建库。"""
+    if not _BUILD_STATE_PATH.exists():
+        return {"chunks": {}}
+    try:
+        data = json.loads(_BUILD_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        log.warning("[ingestion] chunk 状态文件损坏，重新建立状态: %s", _BUILD_STATE_PATH)
+        return {"chunks": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("chunks"), dict):
+        return {"chunks": {}}
+    return data
+
+
+def _save_build_state(state: Dict[str, Any]) -> None:
+    """原子更新 chunk 状态，避免进程中断留下半个 JSON 文件。"""
+    try:
+        _BUILD_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp = _BUILD_STATE_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(_BUILD_STATE_PATH)
+    except OSError:
+        log.warning("[ingestion] chunk 状态保存失败", exc_info=True)
+
+
+def _chunk_state_key(subject: str, pdf_id: Optional[str], cache_key: str) -> str:
+    return f"{subject}|{pdf_id or '-'}|{cache_key}"
 
 
 # ------------------------------------------------------------- 增量建库：分块
@@ -405,6 +464,14 @@ def _normalize_extracted(data: Dict[str, Any]) -> None:
                     log.warning("[ingestion] 例题 %s 的 source 期望对象，实际为 %s，已置空",
                                 it.get("id", "?"), type(src).__name__)
                     it["source"] = {}
+                else:
+                    if "page" in src:
+                        page = _normalize_source_page(
+                            src.get("page"), f"例题 {it.get('id', '?')}")
+                        if page is None:
+                            src.pop("page", None)
+                        else:
+                            src["page"] = page
             cleaned.append(it)
         data[kind] = cleaned
 
@@ -921,10 +988,16 @@ def _audit_graph(graph_db: ScienceGraphStore, subject: str) -> None:
     else:
         log.info("[ingestion] 审计: %s 科无空壳概念节点", subject)
 
-    # 疑似重复概念对：同科内两两比较名称相似度，报告最像的一批
+    # 疑似重复概念对：同科内两两比较名称相似度，报告最像的一批。
+    # 大图谱跳过 O(n^2) 全量审计，避免建库收尾阶段长时间阻塞；可单独运行
+    # analyze 阶段或缩小学科范围做完整审计。
     dup_pairs: List[Tuple[str, str, float]] = []
     described = sorted(n for n in concepts
                        if str(concepts[n].get("description", "")).strip())
+    if len(described) > _DUP_AUDIT_MAX_CONCEPTS:
+        log.warning("[ingestion] 审计: %s 科有 %d 个有描述概念，超过 %d，跳过 O(n^2) 重复扫描",
+                    subject, len(described), _DUP_AUDIT_MAX_CONCEPTS)
+        return
     for i, a in enumerate(described):
         for b in described[i + 1:]:
             ratio = difflib.SequenceMatcher(None, a, b).ratio()
@@ -947,7 +1020,7 @@ def _audit_graph(graph_db: ScienceGraphStore, subject: str) -> None:
 def _build_vector_docs(subject: str, data: Dict[str, Any], *,
                        pdf_id: Optional[str] = None) -> List[Document]:
     """把各类实体各转为一条可检索文本（metadata["id"] 与图节点键一致）。"""
-    docs: List[Document] = []
+    docs_by_id: Dict[str, Document] = {}
 
     def _push(kind: str, name: str, content: str, **extra_meta: Any) -> None:
         """追加一条向量切片：正文为拼接后的实体文本，metadata 携带回表标识。
@@ -959,11 +1032,16 @@ def _build_vector_docs(subject: str, data: Dict[str, Any], *,
         """
         if not name.strip():  # 无名实体不入向量库
             return
-        docs.append(Document(
-            page_content=content.strip(),
-            metadata={"id": node_key(subject, kind, name), "subject": subject,
-                      "type": kind, **extra_meta},
-        ))
+        doc_id = node_key(subject, kind, name)
+        metadata = {"id": doc_id, "name": name, "subject": subject,
+                    "type": kind, **extra_meta}
+        content = content.strip()
+        previous = docs_by_id.get(doc_id)
+        if previous is None:
+            docs_by_id[doc_id] = Document(page_content=content, metadata=metadata)
+        elif content and content not in previous.page_content:
+            previous.page_content = f"{previous.page_content}\n{content}".strip()
+            previous.metadata.update(metadata)
 
     for c in data.get("concepts", []):
         name = c.get("name", "")
@@ -1038,10 +1116,12 @@ def _build_vector_docs(subject: str, data: Dict[str, Any], *,
             lines.append("归属题型：" + ex["question_type"])
         if src.get("page") is not None:
             lines.append(f"出处页码：{src.get('page')}")
-        _push(K_EXAMPLE, key_name, "\n".join(lines),
-              title=ex.get("title", ""), page=src.get("page"))
+        extra_meta = {"title": ex.get("title", "")}
+        if src.get("page") is not None:
+            extra_meta["page"] = src["page"]
+        _push(K_EXAMPLE, key_name, "\n".join(lines), **extra_meta)
 
-    return docs
+    return list(docs_by_id.values())
 
 
 def _build_page_docs(subject: str, pages_data: List[Dict[str, Any]], *,
@@ -1106,7 +1186,11 @@ def _gather_known_context(vector_db: Chroma, graph_db: ScienceGraphStore,
             hits = []
         for h in hits:
             meta = h.metadata or {}
-            name = str(meta.get("id") or "").rsplit(":", 1)[-1].strip()
+            name = str(meta.get("name") or "").strip()
+            if not name:
+                # 兼容旧向量：新写入文档使用独立 name metadata，避免实体名中的
+                # 冒号被当成 node_key 分隔符；旧数据只能按历史 ID 规则回退解析。
+                name = str(meta.get("id") or "").split(":Concept:", 1)[-1].strip()
             if not name:
                 continue
             body_lines = (h.page_content or "").splitlines()
@@ -1224,18 +1308,18 @@ def _maybe_lock(lock: Optional[Any]):
 def _persist_chunk(chunk: List[Dict[str, Any]], subject: str,
                    vector_db: Chroma, graph_db: ScienceGraphStore,
                    data: Dict[str, Any], *, pdf_id: Optional[str] = None,
-                   book_name: Optional[str] = None) -> int:
-    """归一化 + 写图 + 写向量（实体切片 + 本块讲义页切片）+ 图谱落盘。
+                   book_name: Optional[str] = None,
+                   book_id: Optional[str] = None) -> int:
+    """归一化 + 写图 + 写向量（实体切片 + 本块讲义页切片）。
 
-    每处理完一个子块就 graph_db.save() 一次：一次 CLI 调用可能跑几十次 LLM，
-    中途崩溃也只丢当前子块（已处理子块均已持久化），配合按子块内容的抽取
-    缓存即天然获得断点续跑。返回本块写入的向量切片条数。
+    本函数不负责图谱快照保存，由调用方按 chunk 批次 checkpoint；只有双库写入
+    成功后调用方才应将本 chunk 标记为完成。返回本块写入的向量切片条数。
 
     book_name：该 PDF 的教材显示名（--book 传入，缺省用文件名），与 pdf_id 一起
     登记进图谱的 PdfSource 注册表，供问答时把「图谱收录」标注成具体教材名。
+    book_id：该版本归属的「逻辑书」id（--book-id，缺省由 book_name 派生），
+    同名多版本靠它聚合成一本；只写登记表属性，不影响 pdf_id 的数据隔离。
     """
-    if pdf_id and book_name:
-        graph_db.register_pdf_name(pdf_id, book_name)
     # 归一化：校验实体/字段类型（含旧缓存脏数据），杜绝字符串被静默拆成单字符
     _normalize_extracted(data)
     n_kind = {k: len(data.get(k, [])) for k in
@@ -1244,19 +1328,65 @@ def _persist_chunk(chunk: List[Dict[str, Any]], subject: str,
     log.info("[ingestion] JSON 抽取成功: %s",
              ", ".join(f"{k}={v}" for k, v in n_kind.items()))
 
-    # 1. 写入 Graph DB（同时传入本块页码范围：source_pages 越界即幻觉，入库前拦截）
-    _write_graph(graph_db, subject, data, pdf_id=pdf_id,
-                 pages={int(p["page"]) for p in chunk if p.get("page") is not None})
-
-    # 2. 写入 Vector DB（实体切片 + 本块讲义页切片，按 metadata["id"] 幂等 upsert）
+    # 先构造并写入向量；确定性 ID 的 upsert 使失败重试可修复，且向量失败时
+    # 不会先污染当前进程中的图谱。
     docs = (_build_vector_docs(subject, data, pdf_id=pdf_id)
             + _build_page_docs(subject, chunk, pdf_id=pdf_id))
     if docs:
         vector_db.add_documents(docs, ids=[d.metadata["id"] for d in docs])
 
-    # 3. 图谱落盘：向量库由 Chroma 自动持久化，图谱需显式 save 才能跨进程累积
-    graph_db.save()
+    # 向量成功后再写图谱。若图谱写入本身抛错，chunk 状态会标记 failed，
+    # 下次重跑会重新 upsert 向量并重试图谱；不要把此处冒充成跨库事务。
+    if pdf_id and book_name:
+        graph_db.register_pdf_name(pdf_id, book_name, book_id=book_id)
+    _write_graph(graph_db, subject, data, pdf_id=pdf_id,
+                 pages={int(p["page"]) for p in chunk if p.get("page") is not None})
     return len(docs)
+
+
+def _validate_pdf_identity(graph_db: ScienceGraphStore,
+                          pdf_id: Optional[str]) -> None:
+    """阻止已有多教材库继续以无 pdf_id 写入，避免页码键互相覆盖。"""
+    if pdf_id:
+        return
+    has_registered_book = any(
+        nd.get("type") == K_PDF_SOURCE
+        for _nid, nd in graph_db.graph.nodes(data=True)
+    )
+    if has_registered_book:
+        raise ValueError(
+            "当前图谱已包含教材来源，继续建库必须传入 pdf_id；"
+            "请使用 PDF 内容 SHA-256 前 16 位作为 pdf_id"
+        )
+
+
+def _audit_book_versions(graph_db: ScienceGraphStore, pdf_id: Optional[str],
+                         book_name: Optional[str],
+                         book_id: Optional[str] = None) -> None:
+    """建库前审计：同一逻辑书已有其它版本时提醒，避免「默默多出一本书」。
+
+    pdf_id 是 PDF 内容哈希，改一次 PDF 就是一个新 id，因此在展示层看会像
+    多了一本同名教材。这里在写入前把「本次将新增哪本教材的第几个版本」
+    说清楚，并给出两种处置方式（指定当前版本 / 用 --book-id 区分不同教材），
+    但不做任何自动删除或自动合并：错误地"帮用户合并"比多显示一本更难恢复。
+    """
+    if not pdf_id or not book_name:
+        return
+    bid = (book_id or "").strip() or logical_book_id(book_name) or str(pdf_id)
+    others = sorted(
+        str(nd["pdf_id"])
+        for _nid, nd in graph_db.graph.nodes(data=True)
+        if nd.get("type") == K_PDF_SOURCE and nd.get("pdf_id")
+        and str(nd["pdf_id"]) != str(pdf_id) and node_book_id(nd) == bid
+    )
+    if not others:
+        return
+    log.warning(
+        "[ingestion] 教材《%s》已有 %d 个其它版本（%s）；本次将新增版本 %s。"
+        "旧版本仍保留在双库中（数据按 pdf_id 隔离，不会被覆盖）；"
+        "需要指定当前版本执行：python main.py --set-active-version %s；"
+        "若它其实是另一本教材，请用 --book-id 指定不同的逻辑书 id",
+        book_name, len(others), ", ".join(others), pdf_id, pdf_id)
 
 
 def build_knowledge_bases(
@@ -1267,9 +1397,11 @@ def build_knowledge_bases(
     graph_db: Optional[ScienceGraphStore] = None,
     max_chars: int = _CHUNK_MAX_CHARS_DEFAULT,
     max_chunks: Optional[int] = None,
+    save_every_chunks: int = 10,
     meter: Any | None = None,
     pdf_id: Optional[str] = None,
     book_name: Optional[str] = None,
+    book_id: Optional[str] = None,
     progress: Optional[Callable[[dict], None]] = None,
     graph_lock: Optional[Any] = None,
 ) -> Tuple[Chroma, ScienceGraphStore]:
@@ -1278,10 +1410,10 @@ def build_knowledge_bases(
     同一 vector_db / graph_db 可跨多次调用、跨学科累积（全科知识库）。
 
     支持长文档增量建库（增量，而非一次性抽全书）：
-    - 输入页数超过单子块预算（max_chars，默认 6000 字符）时，先按
-      _split_into_chunks 自动切成若干子块（优先在章节标题页之间切），
-      逐块做两批串行抽取并写库；每个子块处理完即 graph_db.save() 一次，
-      崩溃/中断不丢已处理子块；
+        - 输入页数超过单子块预算（max_chars，默认 6000 字符）时，先按
+            _split_into_chunks 自动切成若干子块（优先在章节标题页之间切），
+            逐块做两批串行抽取并写库；按 save_every_chunks 批量 checkpoint，
+            最后一律保存图谱；
     - 每个子块的抽取缓存 key 只取决于该子块自身内容，相同输入重跑自动
       命中缓存（0 次 LLM 调用）——CLI 重复执行同一条命令即断点续跑，
       已处理子块不会被重复计费；
@@ -1298,6 +1430,10 @@ def build_knowledge_bases(
     隔离，节点属性按「越建越全」策略合并（无序列表 union、标量与步骤序列保留
     更长一份、concepts 额外累积 sources 字段记录收录来源）。
 
+    book_name / book_id：教材显示名与其所属「逻辑书」id（见 ScienceGraphStore.
+    register_pdf_name）。同一本教材改版后 pdf_id 会变（内容哈希），展示层靠
+    book_id 聚合成一本；本函数在写入前会审计同名多版本，已有其它版本时告警。
+
     推理模型固定由 config.py + sida-agent/.env 的 REASONING_* 配置决定。
     meter 为可选 TokenMeter 兼容对象（.add(response)），累计真实 token 消耗。
 
@@ -1310,12 +1446,18 @@ def build_knowledge_bases(
       LLM 抽取（耗时主体）仍在锁外并行。
     """
     subject = normalize_subject(subject)
+    if save_every_chunks < 1:
+        raise ValueError("save_every_chunks 必须大于 0")
     log.info("[ingestion] 开始构建知识库: subject=%s, 输入页数=%d",
              SUBJECT_META[subject]["label"], len(pages_data))
     vector_db = vector_db or get_vector_store()
     graph_db = graph_db or ScienceGraphStore.load()
+    _validate_pdf_identity(graph_db, pdf_id)
+    _audit_book_versions(graph_db, pdf_id, book_name, book_id)
     if node_key(subject, K_SUBJECT, subject) not in graph_db.graph:
         graph_db.add_entity(subject, K_SUBJECT, subject, label=SUBJECT_META[subject]["label"])
+    build_state = _load_build_state()
+    state_chunks = build_state.setdefault("chunks", {})
 
     chunks = _split_into_chunks(pages_data, max_chars=max_chars)
     log.info("[ingestion] 输入 %d 页自动切分为 %d 个子块（子块预算 %d 字符）",
@@ -1335,6 +1477,9 @@ def build_knowledge_bases(
         label = _chunk_label(chunk, idx, len(chunks))
         cache_key = _cache_key(subject, _chunk_markdown(chunk))
         data = _load_extract_cache(cache_key)
+        cache_hit = data is not None
+        # 收窄类型必须直接判 `data is None`：Pylance 不会透过布尔别名 cache_hit
+        # 收窄，用 `not cache_hit` 会让 data 全程保持 Optional，后续写库调用报类型错。
         if data is None:
             if max_chunks is not None and done_new >= max_chunks:
                 remain = len(chunks) - idx + 1
@@ -1348,7 +1493,6 @@ def build_knowledge_bases(
                                       "label": label})
             data = _extract_chunk_data(subject, _chunk_markdown(chunk), label,
                                        vector_db, graph_db, meter=meter)
-            _save_extract_cache(cache_key, data)
         else:
             log.info("[ingestion] %s 命中抽取缓存，直接写库（不调用 LLM）", label)
             _emit_progress(progress, {"stage": "extract", "event": "chunk_start",
@@ -1359,11 +1503,41 @@ def build_knowledge_bases(
             _restore_polluted_names(data, {
                 bare_name(nid) for nid, nd in graph_db.graph.nodes(data=True)
                 if nd.get("subject") == subject and nd.get("type") == K_CONCEPT})
-        with _maybe_lock(graph_lock):
-            # _persist_chunk 内含「写图 + save」，整段即临界区（向量库
-            # add_documents 由 Chroma 自身并发保护，不必额外串行化）
-            docs = _persist_chunk(chunk, subject, vector_db, graph_db, data,
-                                  pdf_id=pdf_id, book_name=book_name)
+        state_key = _chunk_state_key(subject, pdf_id, cache_key)
+        state_chunks[state_key] = {
+            "subject": subject,
+            "pdf_id": pdf_id,
+            "cache_key": cache_key,
+            "status": "writing",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _save_build_state(build_state)
+        try:
+            with _maybe_lock(graph_lock):
+                # 向量库由 Chroma 自身保护；图谱写入和批量 checkpoint 仍由 graph_lock
+                # 串行化，避免多个 build 覆盖同一份 JSON 快照。
+                docs = _persist_chunk(chunk, subject, vector_db, graph_db, data,
+                                      pdf_id=pdf_id, book_name=book_name,
+                                      book_id=book_id)
+                if idx % save_every_chunks == 0:
+                    graph_db.save()
+        except Exception as exc:
+            state_chunks[state_key].update({
+                "status": "failed",
+                "error": str(exc)[:500],
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            _save_build_state(build_state)
+            raise
+        if not cache_hit:
+            # 抽取缓存只有在双库写入成功后才落盘，避免“缓存已完成但数据未入库”。
+            _save_extract_cache(cache_key, data)
+        state_chunks[state_key].update({
+            "status": "completed",
+            "docs": docs,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        _save_build_state(build_state)
         total_docs += docs
         _emit_progress(progress, {"stage": "extract", "event": "chunk_done",
                                   "chunk": idx, "total_chunks": len(chunks),

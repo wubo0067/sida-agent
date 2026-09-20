@@ -10,7 +10,8 @@
 #   chat            多轮对话 REPL（会话落盘，Ctrl+C 退出）
 #   ask             单轮问答
 #   build           建库（PDF 提取 + 结构化抽取）
-#   list-books      列出已导入教材
+#   list-books      列出已导入教材（按逻辑书折叠）
+#   list-versions   列出全部内容版本（= list-books --all-versions）
 #   list-sessions   列出对话会话
 #   help            显示帮助
 #
@@ -23,6 +24,8 @@
 #   ./start.sh ask --query "讲解可变电路的分析思路"
 #   ./start.sh build --pdf /path/to/教材.pdf --start-page 1 --end-page 10 --subject physics --yes
 #   ./start.sh list-books
+#   ./start.sh list-versions
+#   ./start.sh set-active-version 8860d10f858ba7eb
 #   ./start.sh list-sessions
 #
 # 环境变量:
@@ -63,7 +66,8 @@ HELP_TEXT='sida-agent 一键启动脚本（Bash）
   chat            多轮对话 REPL（会话落盘，Ctrl+C 退出）
   ask             单轮问答
   build           建库（PDF 提取 + 结构化抽取）
-  list-books      列出已导入教材
+  list-books      列出已导入教材（按逻辑书折叠，同一教材的多个内容版本并成一本）
+  list-versions   列出已导入教材的全部内容版本（= list-books --all-versions）
   list-sessions   列出对话会话
   help            显示本帮助
 
@@ -76,6 +80,8 @@ HELP_TEXT='sida-agent 一键启动脚本（Bash）
   ./start.sh ask --query "讲解可变电路的分析思路"
   ./start.sh build --pdf /path/to/教材.pdf --start-page 1 --end-page 10 --subject physics --yes
   ./start.sh list-books
+  ./start.sh list-versions
+  ./start.sh set-active-version 8860d10f858ba7eb   # 指定某本教材的当前版本
   ./start.sh list-sessions
 
 环境变量:
@@ -127,6 +133,8 @@ case "$CMD" in
     ask)           UV_ARGS=(run python main.py --stage ask) ;;
     build)         UV_ARGS=(run python main.py --stage build) ;;
     list-books)    UV_ARGS=(run python main.py --list-books) ;;
+    list-versions) UV_ARGS=(run python main.py --list-books --all-versions) ;;
+    set-active-version) UV_ARGS=(run python main.py --set-active-version) ;;
     list-sessions) UV_ARGS=(run python main.py --stage chat --list) ;;
     *)
         fail "未知子命令: $CMD"

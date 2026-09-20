@@ -16,6 +16,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
@@ -186,6 +187,33 @@ def node_key(subject: str, kind: str, name: str) -> str:
 def bare_name(node_key_: str) -> str:
     """去掉 `subject:Kind:` 前缀，还原展示用名称。"""
     return node_key_.split(":", 2)[-1]
+
+
+# 逻辑书 id 的空白归一化：折叠连续空白后小写化（大小写/空格差异不拆成两本书）。
+_BOOK_WS_RE = re.compile(r"\s+")
+
+
+def logical_book_id(name: str) -> str:
+    """由教材显示名派生「逻辑书」id（同名不同版本据此聚合成一本）。
+
+    只做空白折叠 + 大小写折叠这类无损归一化，不做任何"智能"猜测：
+    「9S合并PDF-1」与「9S合并PDF-完整」名字不同，仍视为两本书，需要
+    显式用 --book-id 指定同一 id 才会合并。名字为空时返回空串（调用方
+    回退到 pdf_id，即每个无名登记各自独立成册）。
+    """
+    return _BOOK_WS_RE.sub(" ", (name or "").strip()).casefold()
+
+
+def node_book_id(nd: Dict[str, Any]) -> str:
+    """节点归属的逻辑书 id：优先显式属性，其次由显示名派生，最后回退 pdf_id。
+
+    老图谱节点没有 logical_book_id 属性，这里惰性按显示名派生，因此无需
+    任何数据迁移即可获得分组（迁移只影响分组 id 是否可自定义）。
+    """
+    bid = nd.get("logical_book_id")
+    if bid:
+        return str(bid)
+    return logical_book_id(nd.get("name") or "") or str(nd.get("pdf_id") or "")
 
 
 # 各类实体在检索结果中的字段映射：kind -> {输出字段: (节点属性, 是否列表)}
@@ -445,17 +473,38 @@ class ScienceGraphStore:
         self.relate(node_key(subject, kind_a, name_a), relation, node_key(subject, kind_b, name_b))
 
     # ------------------------------------------------------- 教材名注册表
-    def register_pdf_name(self, pdf_id: str, name: str) -> None:
+    def register_pdf_name(self, pdf_id: str, name: str, *,
+                          book_id: Optional[str] = None,
+                          is_active: Optional[bool] = None) -> None:
         """登记 pdf_id -> 教材显示名（存为 PdfSource 节点，随图谱一起 save/load）。
 
         问答生成时按实体 sources 里的 pdf_id 反查此表，把「图谱收录」标注
         升级为「收录于《教材名》」。同名重复登记以最后一次为准（--book 修正）。
+
+        book_id：该版本归属的「逻辑书」id（同名多版本用它聚合显示/切换当前
+            版本）。缺省由 name 派生；显式传入可把书名不同的两次导入
+            （如「9S合并PDF-1」与「9S合并PDF-完整」）合并成一本。
+        is_active：显式指定当前版本；True 时同组其余版本自动置为非当前。
+            缺省 None（不表态）：单版本默认即当前版本，多版本则维持"未指定"。
+
+        本方法只写登记表属性，不触碰任何知识实体，因此重复登记/改名/换
+        当前版本都不会影响 sources、page_refs 与例题键的 pdf_id 隔离。
         """
         if not pdf_id or not name:
             return
-        self.graph.add_node(node_key(_META_SUBJECT, K_PDF_SOURCE, pdf_id),
-                            type=K_PDF_SOURCE, subject=_META_SUBJECT,
-                            pdf_id=pdf_id, name=name)
+        key = node_key(_META_SUBJECT, K_PDF_SOURCE, pdf_id)
+        now = datetime.now().isoformat(timespec="seconds")
+        attrs: Dict[str, Any] = {
+            "type": K_PDF_SOURCE, "subject": _META_SUBJECT,
+            "pdf_id": pdf_id, "name": name,
+            "logical_book_id": (book_id or "").strip() or logical_book_id(name) or pdf_id,
+            "updated_at": now,
+        }
+        if key not in self.graph:          # 首次登记才记创建时间，改名不重置
+            attrs["created_at"] = now
+        self.graph.add_node(key, **attrs)
+        if is_active:
+            self.set_active_version(pdf_id)
         log.debug("[graph_store] 登记教材名: %s -> %s", pdf_id, name)
 
     def pdf_names(self) -> Dict[str, str]:
@@ -465,6 +514,89 @@ class ScienceGraphStore:
             for _nid, nd in self.graph.nodes(data=True)
             if nd.get("type") == K_PDF_SOURCE and nd.get("pdf_id")
         }
+
+    def logical_books(self) -> Dict[str, Dict[str, Any]]:
+        """按「逻辑书」聚合 PdfSource 注册表：同名多版本折叠成一本。
+
+        返回 {logical_book_id: {logical_book_id, name, version_count,
+        active_pdf_id, versions}}；versions 每项为
+        ``{pdf_id, name, is_active, created_at, updated_at}``，按
+        (created_at, pdf_id) 升序（老数据无 created_at，则退化为 pdf_id 序，
+        保证输出稳定可复现）。
+
+        当前版本口径（不猜）：
+        - 只有 1 个版本 -> 该版本即当前版本（无歧义）；
+        - 多版本且被 set_active_version 显式指定过 -> 取最近指定者；
+        - 多版本且从未指定 -> active_pdf_id=None，由调用方显示"未指定"。
+
+        老图谱无 logical_book_id 属性时按显示名惰性派生，故本方法对既有
+        数据零迁移即可用。
+        """
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for _nid, nd in self.graph.nodes(data=True):
+            if nd.get("type") != K_PDF_SOURCE or not nd.get("pdf_id"):
+                continue
+            pid = str(nd["pdf_id"])
+            groups.setdefault(node_book_id(nd), []).append({
+                "pdf_id": pid,
+                "name": nd.get("name", "") or "",
+                "is_active": nd.get("is_active"),
+                "created_at": nd.get("created_at"),
+                "updated_at": nd.get("updated_at"),
+            })
+        books: Dict[str, Dict[str, Any]] = {}
+        for bid, versions in groups.items():
+            versions.sort(key=lambda v: (v["created_at"] or "", v["pdf_id"]))
+            explicit = [v["pdf_id"] for v in versions if v["is_active"] is True]
+            if explicit:
+                active: Optional[str] = explicit[-1]
+            elif len(versions) == 1 and versions[0]["is_active"] is not False:
+                active = versions[0]["pdf_id"]
+            else:
+                active = None
+            counts: Dict[str, int] = {}
+            for v in versions:
+                if v["name"]:
+                    counts[v["name"]] = counts.get(v["name"], 0) + 1
+            name = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0] if counts else ""
+            books[bid] = {
+                "logical_book_id": bid,
+                "name": name,
+                "version_count": len(versions),
+                "active_pdf_id": active,
+                "versions": versions,
+            }
+        return books
+
+    def active_pdf_ids(self) -> Set[str]:
+        """当前生效版本的 pdf_id 集合（未指定当前版本的多版本教材不在此列）。"""
+        return {b["active_pdf_id"] for b in self.logical_books().values()
+                if b["active_pdf_id"]}
+
+    def set_active_version(self, pdf_id: str) -> Optional[str]:
+        """把 pdf_id 设为其逻辑书的当前版本，同组其余版本一并置为非当前。
+
+        只改 PdfSource 登记表属性（is_active/updated_at/logical_book_id），
+        不增删任何知识实体，因此可安全反复切换、可随时改回。返回逻辑书 id；
+        pdf_id 未登记时返回 None（调用方据此报错）。
+        """
+        key = node_key(_META_SUBJECT, K_PDF_SOURCE, pdf_id)
+        if key not in self.graph:
+            return None
+        bid = node_book_id(self.graph.nodes[key])
+        now = datetime.now().isoformat(timespec="seconds")
+        for nid, nd in self.graph.nodes(data=True):
+            if nd.get("type") != K_PDF_SOURCE or not nd.get("pdf_id"):
+                continue
+            if node_book_id(nd) != bid:
+                continue
+            # 顺带回填缺失的 logical_book_id：显式分组一旦确定即固化，
+            # 后续即使 --book 改名也不会让版本"漂"到别的书下。
+            self.graph.nodes[nid]["logical_book_id"] = bid
+            self.graph.nodes[nid]["is_active"] = str(nd["pdf_id"]) == str(pdf_id)
+            self.graph.nodes[nid]["updated_at"] = now
+        log.info("[graph_store] 逻辑书 %s 的当前版本设为 %s", bid, pdf_id)
+        return bid
 
     # --------------------------------------------------------------- 检索
     def get_by_name(self, subject: str, kind: str, name: str) -> Optional[Dict[str, Any]]:

@@ -86,7 +86,9 @@ async def submit_build(body: BuildRequest, request: Request):
         "pdf": body.pdf, "start_page": body.start_page, "end_page": body.end_page,
         "subject": body.subject, "max_chars": body.max_chars,
         "max_new_calls": body.max_new_calls, "max_chunks": body.max_chunks,
+        "save_every_chunks": body.save_every_chunks,
         "book": body.book,
+        "book_id": body.book_id,
     }
     task = rt.builds.submit(params, _make_work(rt, params))
     return BuildAccepted(task_id=task.id, status=task.status,
@@ -122,9 +124,11 @@ def _make_work(rt: Any, params: Dict[str, Any]):
             graph_db=rt.graph_db,
             max_chars=params["max_chars"],
             max_chunks=params["max_chunks"],
+            save_every_chunks=params["save_every_chunks"],
             meter=reasoning_meter,
             pdf_id=pdf_id,
             book_name=book_name,
+            book_id=params.get("book_id"),
             progress=emit,
             graph_lock=rt.graph_lock,
         )

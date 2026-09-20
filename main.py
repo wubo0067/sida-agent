@@ -26,6 +26,8 @@
     uv run python main.py --stage chat --list       # 只列会话清单
     uv run python main.py --stage chat --export s-xxxx # 把会话导出为 Markdown
     uv run python main.py --list-books              # 列出已导入的教材书名后退出
+    uv run python main.py --list-books --all-versions   # 同名多版本展开成逐行
+    uv run python main.py --set-active-version f7ff5074c6215ee7  # 指定某版本为当前版本
     uv run python main.py --stage analyze           # 图谱结构分析（全部学科）
     uv run python main.py --stage analyze --subject math  # 只分析数学
 --stage: all=提取+建库+问答（默认）；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；
@@ -123,6 +125,11 @@ def parse_args() -> argparse.Namespace:
                         help="该 PDF 的教材显示名（如「质心灵动量教育讲义」），用于答案里"
                              "「收录于《教材名》」来源标注；缺省取 PDF 文件名（去扩展名）。"
                              "重复登记同一 --pdf 即改名覆盖。")
+    parser.add_argument("--book-id", dest="book_id", default=None, metavar="逻辑书ID",
+                        help="该 PDF 所属「逻辑书」的 id（同名多版本靠它聚合成一本）。"""
+                             "缺省由 --book 派生：书名相同即同一本。改版后 PDF 内容变了"
+                             "（pdf_id 是内容哈希）但书名没变时，展示层仍会折叠为「N 个版本」；"
+                             "若书名也变了、却确实是同一本，才需显式传本参数合并。")
     parser.add_argument("--start-page", type=int, default=DEFAULT_START_PAGE,
                         help="起始页码（从 1 计）。")
     parser.add_argument("--end-page", type=int, default=DEFAULT_END_PAGE,
@@ -142,13 +149,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export", dest="chat_export", default=None, metavar="ID",
                         help="chat：把指定会话导出为 Markdown 后退出（不进入对话）。")
     parser.add_argument("--list-books", dest="list_books", action="store_true",
-                        help="列出已导入双库的教材书名后退出（不执行任何阶段）。")
+                        help="列出已导入双库的教材书名后退出（不执行任何阶段；"
+                             "同名多版本折叠成一本显示）。")
+    parser.add_argument("--all-versions", dest="all_versions", action="store_true",
+                        help="配合 --list-books：把每个逻辑书的全部版本号逐行展开。")
+    parser.add_argument("--set-active-version", dest="set_active_version", default=None,
+                        metavar="PDF_ID",
+                        help="把该 pdf_id 标记为其所属逻辑书的当前版本后退出。只改"
+                             "登记表属性（is_active），不增删任何图谱/向量数据，可反复切换；"
+                             "版本号用 --list-books --all-versions 查。")
     parser.add_argument("--max-chars", type=int, default=_CHUNK_MAX_CHARS_DEFAULT,
                         help="知识抽取单子块字符预算（build/all）：输入页超过预算即自动"
                              "切块增量抽取，避免整本书一次喂给推理 LLM 超上下文。")
     parser.add_argument("--max-chunks", type=int, default=None, metavar="N",
                         help="本次建库最多处理 N 个未命中缓存的新子块（缓存命中不占额度），"
                              "达到即主动停，已完成子块已落盘/缓存，重跑同命令续跑。")
+    parser.add_argument("--save-every-chunks", type=int, default=10, metavar="N",
+                        help="每处理 N 个抽取子块保存一次图谱快照，末尾仍会保存（默认 10）。")
     parser.add_argument("--max-new-calls", type=int, default=None, metavar="N",
                         help="本次视觉提取最多新调用 N 次（已缓存页不占额度），达到即主动停；"
                              "已完成页已逐页缓存，重跑同命令续跑（控视觉模型成本，"
@@ -230,15 +247,56 @@ def _print_sessions() -> None:
                  s["turns"], s["first_question"] or "（无文字提问）")
 
 
-def _print_books() -> None:
-    """--list-books：打印已登记进图谱库的教材书名清单（PdfSource 注册表）。"""
-    names = ScienceGraphStore.load().pdf_names()
-    if not names:
+def _print_books(*, all_versions: bool = False) -> None:
+    """--list-books：打印已登记进图谱库的教材清单（按「逻辑书」聚合同名多版本）。
+
+    聚合口径来自 ScienceGraphStore.logical_books()：pdf_id 是 PDF 内容哈希，
+    同一本教材改一次就是一个新 id，直接按注册表逐条打印会出现"同名课本被列
+    成好几本"的假象；这里折叠成一行并标明版本数。老图谱无 logical_book_id
+    属性也能用（按显示名惰性派生），不依赖任何迁移。
+
+    多版本且未指定当前版本时显示"未指定"而不猜：老数据没有时间字段，任何
+    单选都会给出误导性的结论，交给 --set-active-version 显式指定。
+    """
+    books = ScienceGraphStore.load().logical_books()
+    if not books:
         log.info("[main] 暂无已导入教材（build 阶段建库时自动登记）")
         return
-    log.info("[main] 已导入教材（共 %d 本）:", len(names))
-    for pdf_id, name in sorted(names.items(), key=lambda kv: (kv[1], kv[0])):
-        log.info("  《%s》 (%s)", name or "（未命名）", pdf_id)
+    ordered = sorted(books.values(), key=lambda b: (b["name"], b["logical_book_id"]))
+    log.info("[main] 已导入教材（共 %d 本 / %d 个版本）:",
+             len(ordered), sum(b["version_count"] for b in ordered))
+    for b in ordered:
+        name = b["name"] or "（未命名）"
+        if b["version_count"] == 1:
+            log.info("  《%s》 (%s)", name, b["versions"][0]["pdf_id"])
+            continue
+        active = b["active_pdf_id"]
+        state = (f"当前 {active}" if active
+                 else "未指定当前版本，用 --set-active-version 指定")
+        log.info("  《%s》 (%d 个版本, %s)", name, b["version_count"], state)
+        if all_versions:
+            for v in b["versions"]:
+                mark = "*" if v["pdf_id"] == active else " "
+                log.info("      %s %s", mark, v["pdf_id"])
+
+
+def _set_active_version(pdf_id: str) -> None:
+    """--set-active-version：在逻辑书内切换当前版本（只改登记表属性）。
+
+    与数据无关，因此不会丢任何内容：旧版本的概念/例题切片仍带原 pdf_id，
+    随时可以切回去。真正的删除是另一件事（见 README 教材版本管理）。
+    """
+    store = ScienceGraphStore.load()
+    names = store.pdf_names()
+    if pdf_id not in names:
+        log.error("[main] 未登记的 pdf_id: %s（用 --list-books --all-versions 查看）",
+                  pdf_id)
+        return
+    book_id = store.set_active_version(pdf_id)
+    store.save()
+    book = store.logical_books().get(book_id or "", {})
+    log.info("[main] 已把《%s》的当前版本设为 %s（共 %d 个版本）",
+             names.get(pdf_id) or "（未命名）", pdf_id, book.get("version_count", 1))
 
 
 def _run_analyze(args: argparse.Namespace) -> None:
@@ -569,8 +627,11 @@ def main() -> None:
     args = parse_args()
 
     # ---- 快捷子模式（不依赖向量库，先行处理） ----
+    if args.set_active_version:
+        _set_active_version(args.set_active_version)
+        return
     if args.list_books:
-        _print_books()
+        _print_books(all_versions=args.all_versions)
         return
     if args.stage == "analyze":
         # 结构分析只读图谱 JSON、不调模型：跳过向量库与 PDF 参数校验
@@ -653,9 +714,11 @@ def main() -> None:
             graph_db=graph_db,
             max_chars=args.max_chars,
             max_chunks=args.max_chunks,
+            save_every_chunks=args.save_every_chunks,
             meter=reasoning_meter,
             pdf_id=pdf_id,
             book_name=book_name,
+            book_id=args.book_id,
         )
         _report_meters(vision_meter, reasoning_meter)
         log.info("[main] 建库完成（stage=%s）", args.stage)

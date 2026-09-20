@@ -189,7 +189,7 @@ uv run python main.py --stage serve --host 127.0.0.1 --port 6173
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 存活检查：`{status, graph_nodes, vector_count}` |
-| GET | `/books` | 已入库教材清单（`pdf_id` + 名称） |
+| GET | `/books` | 已入库教材清单：按**逻辑书**聚合（`count` 本 / `version_count` 版本，每本含 `versions[]` 与 `active_pdf_id`，见 6.15） |
 | GET | `/pdf_images/{pdf_id}/p{页}.png` | **教材原图静态资源**：外部系统据此显示回答附图（见下） |
 | POST | `/ask` | 单轮问答，JSON 返回（含 `answer_path`，同时落盘 `output/answers/`） |
 | POST | `/ask/stream` | **SSE** 流式问答：逐 `token` 帧 → `result` 帧 → `event: end` |
@@ -289,6 +289,7 @@ curl.exe -N -sS "$base/build/tasks/<task_id>/events?since=0"
 | `--stage` | `all` / `build` / `ask` / `chat` / `serve` | `all` | `all`=提取+建库+问答；`build`=仅提取并累加进双库；`ask`=仅复用已持久化双库问答；`chat`=多轮对话 REPL；`serve`=启动 FastAPI HTTP 服务（见 3.4） |
 | `--pdf` | str | `L:/vivi/初三/物理/9S合并PDF-完整.pdf` | 教材 PDF 路径（build/all 使用） |
 | `--book` | str（metavar 教材名） | `None` | 该 PDF 的教材显示名，用于答案「收录于《教材名》」来源标注；缺省取 PDF 文件名去扩展名；重复登记同一 `--pdf` 即改名覆盖 |
+| `--book-id` | str（`dest=book_id`） | `None` | 显式指定**逻辑书 id**，把名称不同的 PDF 并进同一本教材的多个版本（见 6.15）；缺省按「书名字符串相同」自动归并，近重名不猜 |
 | `--start-page` | int | `11` | 起始页码（从 1 计） |
 | `--end-page` | int | `12` | 结束页码（含），超出总页数自动截断 |
 | `--subject` | `physics` / `chemistry` / `math` | `physics` | 学科；接受中文 / 拼音别名，`_subject_choice` 经 `normalize_subject` 归一化，非法值报命令行错误 |
@@ -296,15 +297,20 @@ curl.exe -N -sS "$base/build/tasks/<task_id>/events?since=0"
 | `--session` | str（metavar ID） | `None` | chat：进入 / 续聊指定会话（`thread_id`，见 `--list`）；缺省新建会话 |
 | `--list` | flag（`dest=chat_list`） | `False` | 列出既有会话清单后退出（不进入对话） |
 | `--export` | str（`dest=chat_export`，metavar ID） | `None` | 把指定会话导出为 Markdown 后退出（不进入对话） |
+| `--list-books` | flag（`dest=list_books`） | `False` | 列出已导入教材（按**逻辑书**折叠，见 6.15）后退出 |
+| `--all-versions` | flag（`dest=all_versions`） | `False` | 配合 `--list-books`：展开每本教材的全部内容版本，当前版本前标 `*` |
+| `--set-active-version` | str（`dest=set_active_version`，metavar PDF_ID） | `None` | 指定某本教材的**当前版本**（同逻辑书内切换）后退出；仅改登记表属性，不动知识实体 |
 | `--max-chars` | int | `6000` | 知识抽取单子块字符预算（build/all）：超过即自动切块增量抽取 |
 | `--max-chunks` | int（metavar N） | `None` | 本次建库最多处理 N 个未命中缓存的新子块（缓存命中不占额度），达上限即停、重跑续跑 |
+| `--save-every-chunks` | int（metavar N） | `10` | 每处理 N 个抽取子块保存一次图谱快照，末尾仍会保存；大图谱可适当增大 |
 | `--max-new-calls` | int（metavar N） | `None` | 本次视觉提取最多新调用 N 次（已缓存页不占额度），达上限即停、重跑续跑（控视觉模型成本） |
 | `--yes` | flag | `False` | 跳过建库前的规模预估确认（脚本 / 夜间批量自动放行） |
 | `--host` | str | `127.0.0.1` | serve：HTTP 监听地址 |
 | `--port` | int | `6173` | serve：HTTP 监听端口 |
 | `--reload` | flag | `False` | serve：代码热重载（开发用，uvicorn reload） |
 
-> `--list` / `--export` 在 `main()` 里**先于 `--stage` 分发**处理，命中即执行并退出。
+> `--set-active-version` / `--list-books` / `--list` / `--export` 在 `main()` 里**先于 `--stage` 分发**
+> 处理（`--set-active-version` 优先级最高），命中即执行并退出。
 > 不带任何参数运行 = 全部默认值（等价旧版硬编码流水线，便于快速回归）。
 
 ---
@@ -848,9 +854,11 @@ main.py --stage chat
   `save()` / `load()`（classmethod）用 JSON node_link 格式（**必须带 `edges="links"`**，
   跨 networkx 版本稳定），默认 `output/knowledge_graph.json`。`load` 缺文件 / 解析异常回退空库。
   向量库靠 Chroma 自动持久化，图谱需**显式 save** 才能跨进程累积。
-- **教材名注册表**：`register_pdf_name(pdf_id, name)` 存为 `meta:PdfSource:{pdf_id}` 节点
-  （伪学科 `meta`，不与三科冲突），`pdf_names()` 反查全表。`--book` 传入教材显示名，缺省用文件名去扩展名，
-  重复登记同名 `--pdf` 即改名覆盖。
+- **教材名注册表**：`register_pdf_name(pdf_id, name, book_id=..., is_active=...)` 存为
+  `meta:PdfSource:{pdf_id}` 节点（伪学科 `meta`，不与三科冲突），`pdf_names()` 反查扁平全表。
+  `--book` 传入教材显示名，缺省用文件名去扩展名，重复登记同名 `--pdf` 即改名覆盖。
+  **同一本教材的多个内容版本**（`pdf_id` 是内容哈希，PDF 一改就是新 id）另由 `logical_books()`
+  聚合成「逻辑书」，见 **6.15**。
 - **去重 / 合并方法**：`find_similar_concept`（同科内找最相似已建概念，默认阈值 0.6，
   可跳过空壳）、`merge_concepts`（把 alias 的入边 / 出边按原关系重指到 canonical，
   再按「越建越全」逐字段合并属性、删除 alias；canonical 不存在时整体改名）。
@@ -985,6 +993,74 @@ main.py --stage chat
 **复盘要点**：网络 `nx.DiGraph.has_edge(u, v, x)` 第三参是属性 **key** 而非值，
 手写边去重易踩坑——合并节点应复用既有 `merge_concepts`，不要手搓图手术。
 
+### 6.15 教材版本管理：逻辑书与内容版本（`storage/graph_store.py` + `main.py` + `api`）
+
+**症状**：同一本教材在 `--list-books` / `GET /books` 里重复出现，像「一个 PDF 变成好几本教材」。
+
+**根因**：`pdf_id = sha256(PDF 内容)[:16]` 是**内容寻址**。PDF 重排 / 补页 / 重新导出都会得到新 id，
+于是注册表新增一条同名记录。实测 21 条登记里「二次函数最值」占 4 条
+（`17bf3eefa4d17096` / `8860d10f858ba7eb` / `a0194ddb45283968` / `f7ff5074c6215ee7`），
+另有 `9S合并PDF-1` 与 `9S合并PDF-完整` 属近重名。
+
+**为什么不改 `pdf_id`**：它同时是 `page_refs`（`"{pdf_id}:{页码}"`）、`sources`、例题节点键
+`{pdf_id}:{loc}:{题号}`、讲义页切片键 `subject:Page:{pdf_id}:{页码}`，以及
+`output/pdf_extract/{pdf_id}/`、`output/pdf_images/{pdf_id}/` 的隔离维度。
+改成「按教材名寻址」会让新旧内容互相覆盖，破坏可溯源性与建库幂等。
+
+**方案**：在 `pdf_id` 之上加一层 **`logical_book_id`（逻辑书）**，把「多版本」从数据模型问题
+降级为展示 + 版本治理问题：
+
+| 层 | 键 | 语义 |
+|---|---|---|
+| 逻辑书 | `logical_book_id(name)` = `" ".join(name.split()).casefold()` | 「这是同一本教材」 |
+| 内容版本 | `pdf_id`（登记节点仍是 `meta:PdfSource:{pdf_id}`） | 「这是该教材的某一版内容」 |
+
+- **归并规则不猜**：默认只有**书名字符串相同**（空白折叠 + 大小写折叠）才归为一本；
+  近重名（`9S合并PDF-1` vs `9S合并PDF-完整`）必须用 `--book-id` 显式合并。
+  不做文件名相似度 / 编辑距离猜测，避免把「二次函数最值」与
+  「数形结合视角下二次函数闭区间最值问题」错并成一本。
+- **老数据零迁移**：`PdfSource` 节点上没有 `logical_book_id` 属性时，`node_book_id(nd)` 惰性从
+  `name` 派生；`pdf_names()` 的扁平视图保持原样，`agent/workflow._books_of` 与图谱截断告警不受影响。
+- **当前版本不自动选**：单版本 = 隐式当前版本；多版本必须 `--set-active-version <pdf_id>` 显式指定，
+  否则 `active_pdf_id=None`，对外显示「未指定当前版本」。理由：老登记表没有 `created_at`，
+  按 id 或名字排序单选都会给出误导性结论。
+- **切换只动登记表**：`set_active_version` 只写 `logical_book_id` / `is_active` / `updated_at`，
+  可反复切换，**不触碰** `sources` / `page_refs` / 例题节点，因此不影响检索与溯源。
+- **新版本入库只告警**：`ingestion._audit_book_versions` 在检测到同逻辑书已有其它版本时提示
+  「可 `--set-active-version` 指定当前版本，或用 `--book-id` 显式合并」，**不做任何自动删除或合并**。
+
+**CLI**：`--list-books` 输出折叠视图（21 条登记 → **18 本 / 21 个版本**），`--all-versions` 展开明细：
+
+```
+[main] 已导入教材（共 18 本 / 21 个版本）:
+  《26秋9A+第一讲相似中的垂直模型》 (3960e504527616ee)
+  《二次函数最值》 (4 个版本, 未指定当前版本，用 --set-active-version 指定)
+           17bf3eefa4d17096          # ← 仅 --all-versions 展开
+           8860d10f858ba7eb
+```
+
+**HTTP**：`GET /books` 返回聚合结构，`POST /build` 新增可选 `bookId`（把不同名 PDF 并进同一本逻辑书）：
+
+```json
+{ "count": 18, "version_count": 21,
+  "books": [ { "logical_book_id": "二次函数最值", "name": "二次函数最值",
+               "version_count": 4, "active_pdf_id": null,
+               "versions": [ { "pdf_id": "17bf3eefa4d17096", "name": "二次函数最值",
+                               "is_active": null, "created_at": null, "updated_at": null } ] } ] }
+```
+
+**测试**：`tests/test_book_versions.py`（同名折叠 / `created_at` 排序 / 异名不合并 / 显式 `book_id` 合并 /
+空白大小写归一化 / 老节点无属性仍能分组 / 空参忽略 / 单版本隐式活跃 / 多版本未指定 /
+`set_active_version` 仅组内生效且可反复切换 / 未知 id 返回 `None` / 重复登记保留 `created_at` /
+`pdf_names()` 视图不变 / 登记不碰知识实体）+ `tests/test_ingestion.py` 的 3 例 `_audit_book_versions` 用例。
+运行：`python -m unittest tests.test_book_versions tests.test_ingestion`
+（`tests/` 无 `__init__.py`，不要用 `unittest discover`）。
+
+**第 4 层（删除旧版本）尚未实现**：剥离图谱里的 `sources` / `page_refs`、删只属于该 `pdf_id` 的例题节点
+与 `meta:PdfSource:{pdf_id}` 节点、Chroma `delete(where={"pdf_id": ...})`、
+`output/pdf_images/{pdf_id}/`，都是**不可逆**的破坏性操作，需配 `--dry-run` + 时间戳备份 + 逐步校验，
+另行设计（当前只做非破坏性的 1~3 层：分组、展示、当前版本指定）。
+
 ---
 
 ## 7. 已知局限 / 待优化项
@@ -1036,8 +1112,12 @@ main.py --stage chat
   `FileNotFoundError`，应在部署环境显式传入路径或改为配置项。
 - **迁移脚本包含历史 `pdf_id`**：`migrate_book_sources.py` 硬编码两个历史 PDF ID 到教材名，
   是一次性迁移脚本，不适合作为通用数据迁移工具。
-- **缺少项目级自动化测试和冒烟脚本**：当前仓库没有项目自己的 `test_*.py` 或 smoke 脚本，
-  正确性主要依赖日志、人工核对和已有的定向验证。
+- **自动化测试覆盖仍很薄**：`tests/` 下只有 `test_ingestion.py` 与 `test_book_versions.py` 两个
+  模块级用例集，且 `tests/` 没有 `__init__.py`（必须 `python -m unittest tests.<模块>`，
+  `unittest discover` 会报 `Start directory is not importable`），没有 CI 与冒烟脚本，
+  其余正确性主要依赖日志、人工核对和定向验证。
+- **教材版本删除缺位**：目前只能分组展示与指定当前版本，清理旧版本（图谱 / 向量库 / 图片）
+  属破坏性操作，尚未实现（见 6.15）。
 - **README 的 Embedding 示例不完全一致**：安装示例和 `.env` 示例应使用同一个模型；端口则可能
   因部署环境使用 `11434` 或自定义端口。实际模型和地址应以同一份 `.env` 配置为准。
 - **提示词的教学取舍缺少说明**：`SUBJECT_ANSWER_GUIDE` 和视觉 `PROMPT` 中部分教学约束的

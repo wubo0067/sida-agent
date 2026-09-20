@@ -18,11 +18,13 @@
     .\start.ps1 ask --query "讲解可变电路的分析思路"
     .\start.ps1 build --pdf "L:/vivi/.../教材.pdf" --start-page 1 --end-page 10 --subject physics --yes
     .\start.ps1 list-books
+    .\start.ps1 list-versions
+    .\start.ps1 set-active-version 8860d10f858ba7eb
     .\start.ps1 list-sessions
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Position = 0, HelpMessage = '子命令: serve|chat|ask|build|list-books|list-sessions|help')]
+    [Parameter(Position = 0, HelpMessage = '子命令: serve|chat|ask|build|list-books|list-versions|set-active-version|list-sessions|help')]
     [string]$Command,
 
     [switch]$SkipSync,
@@ -61,7 +63,8 @@ sida-agent 一键启动脚本（PowerShell）
   chat            多轮对话 REPL（会话落盘，Ctrl+C 退出）
   ask             单轮问答
   build           建库（PDF 提取 + 结构化抽取）
-  list-books      列出已导入教材
+  list-books      列出已导入教材（按逻辑书折叠，同一教材的多个内容版本并成一本）
+  list-versions   列出已导入教材的全部内容版本（= list-books --all-versions）
   list-sessions   列出对话会话
   help            显示本帮助
 
@@ -74,6 +77,8 @@ sida-agent 一键启动脚本（PowerShell）
   .\start.ps1 ask --query "讲解可变电路的分析思路"
   .\start.ps1 build --pdf "L:/vivi/.../教材.pdf" --start-page 1 --end-page 10 --subject physics --yes
   .\start.ps1 list-books
+  .\start.ps1 list-versions
+  .\start.ps1 set-active-version 8860d10f858ba7eb   # 指定某本教材的当前版本
   .\start.ps1 list-sessions
 
 -SkipSync  跳过 uv sync 依赖同步（依赖未变时启动更快）。
@@ -127,6 +132,8 @@ switch ($Command) {
     'ask' { $UvArgs += '--stage', 'ask' }
     'build' { $UvArgs += '--stage', 'build' }
     'list-books' { $UvArgs += '--list-books' }
+    'list-versions' { $UvArgs += '--list-books', '--all-versions' }
+    'set-active-version' { $UvArgs += '--set-active-version' }
     'list-sessions' { $UvArgs += '--stage', 'chat', '--list' }
     default {
         Fail "未知子命令: $Command"
