@@ -5,7 +5,7 @@
 会话历史经 SqliteSaver 按 thread_id 持久化到 output/chat/checkpoints.sqlite，
 与 CLI chat 完全共用：CLI ``--session`` 能续聊 API 创建的会话，反之亦然。
 
-- GET  /chat/sessions                     会话清单（同 chat --list）
+- GET  /chat/sessions                     会话清单（分页：?limit=&offset=，同 chat --list）
 - POST /chat/sessions                     新建会话（返回 thread_id）
 - GET  /chat/sessions/{id}                某会话完整消息快照
 - POST /chat/sessions/{id}/messages       发一轮提问：stream=true 走 SSE 逐 token，
@@ -18,16 +18,20 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 
-from api.deps import (resolve_image_base_url, run_blocking,
-                      sse_from_producer)
+from api.deps import resolve_image_base_url, run_blocking, sse_from_producer
 from api.runner import ensure_session, run_chat_turn, session_messages
-from api.schemas import (ChatMessageRequest, ChatTurnResult,
-                        CreateSessionRequest, ExportResult, SessionDetail,
-                        SessionList)
-from chat_session import export_session_md, list_sessions
+from api.schemas import (
+    ChatMessageRequest,
+    ChatTurnResult,
+    CreateSessionRequest,
+    ExportResult,
+    SessionDetail,
+    SessionList,
+)
+from chat_session import DEFAULT_LIST_LIMIT, export_session_md, list_sessions
 
 router = APIRouter(tags=["chat"])
 
@@ -40,14 +44,40 @@ def _check_id(session_id: str) -> str:
     if not _SESSION_ID_RE.match(session_id):
         raise HTTPException(
             status_code=422,
-            detail="会话 id 只允许字母/数字/下划线/点/短横线，长度 1-64")
+            detail="会话 id 只允许字母/数字/下划线/点/短横线，长度 1-64",
+        )
     return session_id
 
 
-@router.get("/chat/sessions", response_model=SessionList, summary="会话清单")
-async def get_sessions() -> SessionList:
-    rows = await run_blocking(list_sessions)
-    return SessionList(count=len(rows), sessions=rows)
+@router.get("/chat/sessions", response_model=SessionList, summary="会话清单（分页）")
+async def get_sessions(
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        le=200,
+        description=(
+            "每页条数（1-200）。缺省=返回全部（兼容旧客户端，会话很多时较慢）；"
+            "分页请求建议传值，例如 50"
+        ),
+    ),
+    offset: int = Query(0, ge=0, description="起始偏移（翻页用）"),
+) -> SessionList:
+    """会话清单（按最近更新倒序）。
+
+    分页在 SQL 层完成排序与切片：只有当前页的会话会被反序列化检查点，
+    因此请求耗时与会话总数解耦、只与 ``limit`` 相关。响应带 ``total`` 与
+    ``has_more``，前端按 ``offset += limit`` 翻页即可。
+    """
+    page_limit = DEFAULT_LIST_LIMIT if limit is None else limit
+    rows, total = await run_blocking(list_sessions, limit=page_limit, offset=offset)
+    return SessionList(
+        total=total,
+        count=len(rows),
+        limit=limit,
+        offset=offset,
+        has_more=offset + len(rows) < total,
+        sessions=rows,
+    )
 
 
 @router.post("/chat/sessions", response_model=SessionDetail, summary="新建会话")
@@ -57,8 +87,9 @@ async def create_session(body: CreateSessionRequest) -> SessionDetail:
     return SessionDetail(thread_id=sid, history_summary="", messages=[])
 
 
-@router.get("/chat/sessions/{session_id}", response_model=SessionDetail,
-            summary="会话历史快照")
+@router.get(
+    "/chat/sessions/{session_id}", response_model=SessionDetail, summary="会话历史快照"
+)
 async def get_session(session_id: str) -> SessionDetail:
     _check_id(session_id)
     data = await run_blocking(session_messages, session_id)
@@ -67,27 +98,38 @@ async def get_session(session_id: str) -> SessionDetail:
     return SessionDetail(**data)
 
 
-@router.post("/chat/sessions/{session_id}/messages",
-             summary="发一轮提问（默认 SSE 流式）")
-async def post_message(session_id: str, body: ChatMessageRequest,
-                       request: Request):
+@router.post(
+    "/chat/sessions/{session_id}/messages", summary="发一轮提问（默认 SSE 流式）"
+)
+async def post_message(session_id: str, body: ChatMessageRequest, request: Request):
     rt = request.app.state.runtime
     sid = _check_id(session_id)
     base = resolve_image_base_url(request)
 
     def _producer() -> object:
-        return run_chat_turn(sid, body.message, vector_db=rt.vector_db,
-                             graph_db=rt.graph_db, image_base_url=base)
+        return run_chat_turn(
+            sid,
+            body.message,
+            vector_db=rt.vector_db,
+            graph_db=rt.graph_db,
+            image_base_url=base,
+        )
 
     if body.stream:
-        return StreamingResponse(sse_from_producer(_producer),
-                                 media_type="text/event-stream")
+        return StreamingResponse(
+            sse_from_producer(_producer), media_type="text/event-stream"
+        )
 
     # 非流式：收集 token 事件拼出完整回复，取 result 事件作响应体
     def _collect() -> dict:
         out: Optional[dict] = None
-        for ev in run_chat_turn(sid, body.message, vector_db=rt.vector_db,
-                                graph_db=rt.graph_db, image_base_url=base):
+        for ev in run_chat_turn(
+            sid,
+            body.message,
+            vector_db=rt.vector_db,
+            graph_db=rt.graph_db,
+            image_base_url=base,
+        ):
             if ev.get("type") == "result":
                 out = ev["data"]
         if out is None:
@@ -98,14 +140,16 @@ async def post_message(session_id: str, body: ChatMessageRequest,
     return ChatTurnResult(**data)
 
 
-@router.post("/chat/sessions/{session_id}/export", response_model=ExportResult,
-             summary="导出会话为 Markdown")
+@router.post(
+    "/chat/sessions/{session_id}/export",
+    response_model=ExportResult,
+    summary="导出会话为 Markdown",
+)
 async def export_session(session_id: str, download: bool = False):
     _check_id(session_id)
     path = await run_blocking(export_session_md, session_id)
     if path is None:
         raise HTTPException(status_code=404, detail=f"会话不存在或为空: {session_id}")
     if download:
-        return FileResponse(str(path), media_type="text/markdown",
-                            filename=path.name)
+        return FileResponse(str(path), media_type="text/markdown", filename=path.name)
     return ExportResult(thread_id=session_id, path=str(path.resolve()))

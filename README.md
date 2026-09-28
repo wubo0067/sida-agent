@@ -193,7 +193,7 @@ uv run python main.py --stage serve --host 127.0.0.1 --port 6173
 | GET | `/pdf_images/{pdf_id}/p{页}.png` | **教材原图静态资源**：外部系统据此显示回答附图（见下） |
 | POST | `/ask` | 单轮问答，JSON 返回（含 `answer_path`，同时落盘 `output/answers/`） |
 | POST | `/ask/stream` | **SSE** 流式问答：逐 `token` 帧 → `result` 帧 → `event: end` |
-| GET | `/chat/sessions` | 会话列表（与 CLI **共用** `checkpoints.sqlite`） |
+| GET | `/chat/sessions?limit=&offset=` | 会话列表（**SQL 层分页**，按最近更新倒序；与 CLI **共用** `checkpoints.sqlite`。`limit` 1–200，缺省=全部；响应含 `total`/`has_more`，见 6.10） |
 | POST | `/chat/sessions` | 新建会话（可选传 `session_id`） |
 | GET | `/chat/sessions/{id}` | 读取某会话历史（`messages` + 摘要） |
 | POST | `/chat/sessions/{id}/messages` | 发一轮消息：`stream=true`（默认）走 SSE，否则 JSON |
@@ -245,7 +245,9 @@ curl.exe -N -sS -X POST "$base/ask/stream" `
 
 # ---- 多轮会话（与 CLI chat 共用 checkpoints.sqlite）----
 # 会话列表 / 新建会话（可自定 id）
-curl.exe -sS "$base/chat/sessions"
+curl.exe -sS "$base/chat/sessions"          # 不分页=返回全部（兼容旧客户端）
+curl.exe -sS "$base/chat/sessions?limit=20&offset=0"   # 分页：第 1 页，每页 20 条
+curl.exe -sS "$base/chat/sessions?limit=20&offset=20"  # 分页：第 2 页
 curl.exe -sS -X POST "$base/chat/sessions" `
   -H "Content-Type: application/json" `
   -d '{\"session_id\":\"s-demo01\"}'
@@ -296,6 +298,7 @@ curl.exe -N -sS "$base/build/tasks/<task_id>/events?since=0"
 | `--query` | str | `请帮我系统讲解可变电路的分析思路，并用具体的典型例题带我推导一遍` | 学生提问（ask/all 使用） |
 | `--session` | str（metavar ID） | `None` | chat：进入 / 续聊指定会话（`thread_id`，见 `--list`）；缺省新建会话 |
 | `--list` | flag（`dest=chat_list`） | `False` | 列出既有会话清单后退出（不进入对话） |
+| `--list-limit` | int（`dest=chat_list_limit`，metavar N） | `None` | 配合 `--list`：只列最近 N 条（缺省列全部，`N<=0` 视为不限制），会话多时快速看最新几条 |
 | `--export` | str（`dest=chat_export`，metavar ID） | `None` | 把指定会话导出为 Markdown 后退出（不进入对话） |
 | `--list-books` | flag（`dest=list_books`） | `False` | 列出已导入教材（按**逻辑书**折叠，见 6.15）后退出 |
 | `--all-versions` | flag（`dest=all_versions`） | `False` | 配合 `--list-books`：展开每本教材的全部内容版本，当前版本前标 `*` |
@@ -804,9 +807,10 @@ main.py --stage chat
   下一轮执行前 checkpointer 自动恢复全部历史消息，模型因此「记得」之前聊过什么。
 - **续聊 = 复用 thread_id**：`--session s-xxxx` 只是把既有 id 传进 config，
   LangGraph 自动从 sqlite 取该 thread 最新 checkpoint 恢复状态，无需手工加载。
-- 读取快照不依赖 `SqliteSaver.list` 的顺序承诺：`_latest_tuple` 遍历该会话全部
-  checkpoint 按 `ts` 取最大；`--list` 用只读 SQL `SELECT DISTINCT thread_id FROM checkpoints`
-  列会话；`/export` 从最新快照同时取 `messages` 与 `history_summary` 导出 Markdown。
+- 读取快照不依赖 `SqliteSaver.list` 的顺序承诺：**单会话**链路（`session_snapshot`）
+  用 `_latest_tuple` 遍历该会话全部 checkpoint 按 `ts` 取最大；**会话清单**则走
+  分页 SQL + `SqliteSaver.get_tuple`（见下方「④」）；`/export` 从最新快照同时取
+  `messages` 与 `history_summary` 导出 Markdown。
 - REPL 内置命令：`/exit` `/quit` `/q` `退出` `再见`、`/new`、`/export`、`/list`、
   `/session <id>`、`/help`。会话 id 形如 `s-` + uuid 前 12 位（`_new_thread_id`）。
 
@@ -835,6 +839,38 @@ main.py --stage chat
 注意第三行：换一个 `thread_id` 后，新会话只能用到双库知识，**不会**检索或继承旧会话
 聊过什么（旧会话仅能靠 `--session` 续聊或 `/export` 取回）。单轮模式（`ask`/`all`）
 不传 checkpointer，完全无对话记忆，只把答案存 `output/answers/*.md`。
+
+**④ 会话清单分页（`list_sessions(limit, offset)`）**
+
+背景：checkpoints 表**每轮一行**，会话日积月累后「列出全部会话」会随会话数线性变慢——
+旧实现把每个会话的最新 checkpoint **反序列化**后再计算轮数 / 首问 / 字符数，
+800 个会话即约 45ms 且随会话数线性增长（会话上万就会成为明显卡顿的接口）。
+
+分页设计（耗时与**会话总数解耦**、只与 `limit` 相关）：
+
+1. 排序与切片在 **SQL 层**完成，且只碰索引不碰 BLOB：
+   `SELECT thread_id, MAX(checkpoint_id) FROM checkpoints GROUP BY thread_id
+   ORDER BY 2 DESC LIMIT ? OFFSET ?`。`checkpoint_id` 是 uuid7 单调串，字典序即时间序，
+   故 `MAX(...) DESC` 与按 `checkpoint.ts` 倒序一致（实测 42/42 相同）；`MAX()` 走
+   `(thread_id, checkpoint_ns, checkpoint_id)` 主键索引。**只对当前页的 id** 去反序列化快照。
+2. 取「每会话最新 checkpoint」用 `SqliteSaver.get_tuple()`（省略 `checkpoint_id` 时即
+   `ORDER BY checkpoint_id DESC LIMIT 1` 单行查询）取代旧的「遍历该会话全部 checkpoint
+   取 ts 最大」——两者逐项等价（实测 42/42 的 `ts`+`id` 相同），单会话 0.085s → 0.007s。
+   `_latest_tuple` 因此只保留给**单会话**的 `session_snapshot`（范围有界）。
+3. 实测（合成 800 会话、每个 3 层历史快照）：`limit=10` → 3ms、`limit=50` → 6ms、
+   不分页 800 → 45ms；真实库 42 会话：分页 15ms vs 全量 15ms（临界规模下无开销）。
+
+接口约定（`/chat/sessions`，见 3.4 表）：
+
+- `limit`：1–200；**缺省=返回全部**（兼容旧客户端）。服务端即便收到缺省也按
+  `DEFAULT_LIST_LIMIT=50` 的单页去查询，避免「一次请求又把全部会话拖回来」；
+- `offset`：起始偏移；越界返回空 `sessions` 但 `total` 仍为真实总数（前端据此校正页码）；
+- 响应含 `total`（会话总数，与 `limit` 无关）/ `count`（本页条数）/ `limit`/`offset`
+  （回显参数，缺省分页时 `limit=null`）/ `has_more`（`offset + count < total`）；
+  翻页即 `offset += limit`。
+- CLI 侧 `--list` 默认仍打印全部（交互式翻找的既有行为）；`--list-limit N` 只列最近 N 条。
+- 单测 `tests/test_chat_sessions.py`（14 例）：页间不重不漏（拼接 == 全量）、越界保留
+  `total`、`limit=0` 只回总数、负数钳制、损坏库吞异常、API 契约与 `limit`/`offset` 校验（422）。
 
 ### 6.11 成本 / 资源控制（`main.py`）
 
@@ -1193,9 +1229,10 @@ main.py --stage chat
   `FileNotFoundError`，应在部署环境显式传入路径或改为配置项。
 - **迁移脚本包含历史 `pdf_id`**：`migrate_book_sources.py` 硬编码两个历史 PDF ID 到教材名，
   是一次性迁移脚本，不适合作为通用数据迁移工具。
-- **自动化测试覆盖仍很薄**：`tests/` 下只有 `test_ingestion.py`、`test_book_versions.py` 与
-  `test_vector_fallback.py` 三个模块级用例集，且 `tests/` 没有 `__init__.py`（必须
-  `python -m unittest tests.<模块>`，`unittest discover` 会报 `Start directory is not importable`），
+- **自动化测试覆盖仍很薄**：`tests/` 下只有 `test_ingestion.py`、`test_book_versions.py`、
+  `test_vector_fallback.py` 与 `test_chat_sessions.py` 四个模块级用例集（后者覆盖会话清单分页，
+  见 6.10④），且 `tests/` 没有 `__init__.py`（必须 `python -m unittest tests.<模块>`，
+  `unittest discover` 会报 `Start directory is not importable`），
   没有 CI 与冒烟脚本，其余正确性主要依赖日志、人工核对和定向验证。
 - **教材版本删除缺位**：目前只能分组展示与指定当前版本，清理旧版本（图谱 / 向量库 / 图片）
   属破坏性操作，尚未实现（见 6.15）。

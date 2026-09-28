@@ -23,7 +23,8 @@ class BookVersion(BaseModel):
     pdf_id: str
     name: str = ""
     is_active: Optional[bool] = Field(
-        None, description="是否被显式指定为当前版本；None=未表述（老数据）")
+        None, description="是否被显式指定为当前版本；None=未表述（老数据）"
+    )
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -31,7 +32,9 @@ class BookVersion(BaseModel):
 class BookItem(BaseModel):
     """一本「逻辑书」（同名多版本聚合成一条，前端不再看到同名重复项）。"""
 
-    logical_book_id: str = Field(..., description="逻辑书 id（同名归一化，可由 --book-id 指定）")
+    logical_book_id: str = Field(
+        ..., description="逻辑书 id（同名归一化，可由 --book-id 指定）"
+    )
     name: str
     version_count: int = Field(1, description="已导入的内容版本数")
     active_pdf_id: Optional[str] = Field(
@@ -51,7 +54,8 @@ class BookList(BaseModel):
 class AskRequest(BaseModel):
     query: str = Field(..., min_length=1, description="学生提问")
     subject: Optional[Subject] = Field(
-        None, description="可选：预选学科；缺省由 Agent 自动判定")
+        None, description="可选：预选学科；缺省由 Agent 自动判定"
+    )
     save: bool = Field(True, description="是否同时把讲解保存为 output/answers/*.md")
 
 
@@ -62,13 +66,15 @@ class AskResult(BaseModel):
     intent: Optional[str] = None
     final_answer: str
     answer_path: Optional[str] = Field(
-        None, description="save=true 时写出的 Markdown 路径")
+        None, description="save=true 时写出的 Markdown 路径"
+    )
 
 
 # ---- /chat ----
 class CreateSessionRequest(BaseModel):
     session_id: Optional[str] = Field(
-        None, description="指定新会话 id；缺省自动生成 s-xxxx")
+        None, description="指定新会话 id；缺省自动生成 s-xxxx"
+    )
 
 
 class SessionSummary(BaseModel):
@@ -80,7 +86,21 @@ class SessionSummary(BaseModel):
 
 
 class SessionList(BaseModel):
-    count: int
+    """会话清单分页页（GET /chat/sessions）。
+
+    - ``total``：会话总数（与 ``limit`` 无关，翻页判据）；
+    - ``count``：本页返回的条数；
+    - ``limit``/``offset``：回显本次分页参数（``limit=None`` = 未分页，返回全部）；
+    - ``has_more``：是否还有下一页（``offset + count < total``）。
+    """
+
+    total: int = Field(..., description="会话总数（与 limit 无关）")
+    count: int = Field(..., description="本页条数")
+    limit: Optional[int] = Field(
+        None, description="本页请求的条数；null=未分页（返回全部）"
+    )
+    offset: int = Field(0, description="本页起始偏移")
+    has_more: bool = Field(False, description="是否还有下一页")
     sessions: List[SessionSummary]
 
 
@@ -121,7 +141,10 @@ class EstimateRequest(BaseModel):
     subject: Subject = "physics"
     max_chars: int = Field(_CHUNK_MAX_CHARS_DEFAULT, alias="maxChars")
     max_new_calls: Optional[int] = Field(
-        None, alias="maxNewCalls", description="本批视觉新调用上限，同 CLI --max-new-calls")
+        None,
+        alias="maxNewCalls",
+        description="本批视觉新调用上限，同 CLI --max-new-calls",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -138,19 +161,24 @@ class EstimateResult(BaseModel):
     approx_len: int
     vision_capped: bool
     new_calls_total: int = Field(
-        0, description="new_vision_calls + new_chunks*2，预估新增模型调用总量")
+        0, description="new_vision_calls + new_chunks*2，预估新增模型调用总量"
+    )
 
 
 class BuildRequest(EstimateRequest):
     book: Optional[str] = Field(None, description="教材显示名，同 CLI --book")
     book_id: Optional[str] = Field(
-        None, alias="bookId",
-        description="逻辑书 id（同名多版本聚合用），同 CLI --book-id；缺省由 book 派生")
+        None,
+        alias="bookId",
+        description="逻辑书 id（同名多版本聚合用），同 CLI --book-id；缺省由 book 派生",
+    )
     max_chunks: Optional[int] = Field(None, alias="maxChunks")
-    save_every_chunks: int = Field(10, ge=1, alias="saveEveryChunks",
-                                  description="每 N 个子块保存一次图谱快照")
+    save_every_chunks: int = Field(
+        10, ge=1, alias="saveEveryChunks", description="每 N 个子块保存一次图谱快照"
+    )
     confirm: bool = Field(
-        True, description="false 且存在新调用时不启动，仅回 409 让调用方看预估")
+        True, description="false 且存在新调用时不启动，仅回 409 让调用方看预估"
+    )
 
 
 class BuildAccepted(BaseModel):

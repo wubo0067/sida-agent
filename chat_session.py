@@ -12,6 +12,8 @@ checkpointer 逐轮落盘 output/chat/checkpoints.sqlite。
 - 会话导出读取该会话「最新 checkpoint 快照」的 messages 通道（累积快照，
   含全部尚未截断的消息）；被 manage_context 截断的更早部分由 history_summary
   覆盖摘要，导出时置于文件头部说明。
+- 会话清单分页：list_sessions(limit, offset) 在 SQL 层按最近更新倒序切片，
+  只反序列化当前页的 checkpoint，请求耗时与会话总数解耦（见其 docstring）。
 """
 
 from __future__ import annotations
@@ -30,6 +32,9 @@ from storage.image_store import relativize_image_paths
 
 # 检查点落盘目录（相对 sida-agent 工作目录，与 vector_db/graph 同根 output/）
 _CHAT_DB_DIR = Path("output") / "chat"
+
+# 会话清单默认每页条数：SQL 层分页，避免会话上万后一次反序列化全部 checkpoint
+DEFAULT_LIST_LIMIT = 50
 
 
 def chat_db_path() -> Path:
@@ -55,6 +60,9 @@ def _latest_tuple(saver: SqliteSaver, thread_id: str) -> Optional[Any]:
 
     SqliteSaver.list 未承诺返回顺序，这里遍历该会话全部后按 checkpoint.ts
     取最大（ts 为 UTC ISO 时间串，字典序即时间序）。
+
+    只服务单会话链路（session_snapshot：读快照/导出），遍历范围有界；
+    会话清单请用 _page_tuples（走 get_tuple 单行主键查询）+ SQL 分页。
     """
     best: Optional[Any] = None
     best_ts = ""
@@ -76,8 +84,7 @@ def _msg_text(msg: AnyMessage) -> str:
         return c
     # 多模态/带思考块的消息：content 是 [{"type": "text", "text": ...}, ...]
     if isinstance(c, list):
-        return "".join(b.get("text", "") if isinstance(b, dict) else str(b)
-                       for b in c)
+        return "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in c)
     # 兜底：其他类型（如 None）转字符串，避免调用方拿到非 str
     return str(c)
 
@@ -88,28 +95,68 @@ def _normalize_math_delims(text: str) -> str:
     chat_session 独立维护一份，避免与 main 相互循环导入。
     """
     # 块级公式：\[ ... \] -> $$ ... $$（re.S 让 . 跨行匹配多行公式）
-    text = re.sub(r"\\\[\s*(.*?)\s*\\\]",
-                  lambda m: "$$\n" + m.group(1).strip() + "\n$$", text, flags=re.S)
+    text = re.sub(
+        r"\\\[\s*(.*?)\s*\\\]",
+        lambda m: "$$\n" + m.group(1).strip() + "\n$$",
+        text,
+        flags=re.S,
+    )
     # 行内公式：\( ... \) -> $ ... $
-    text = re.sub(r"\\\(\s*(.*?)\s*\\\)",
-                  lambda m: "$" + m.group(1).strip() + "$", text, flags=re.S)
+    text = re.sub(
+        r"\\\(\s*(.*?)\s*\\\)",
+        lambda m: "$" + m.group(1).strip() + "$",
+        text,
+        flags=re.S,
+    )
     return text
 
 
-def _all_thread_ids() -> List[str]:
-    """直接 SQL 列出存在过的 thread_id（不依赖 saver.list 语义差异）。"""
+def _count_threads() -> int:
+    """会话总数（不反序列化任何 checkpoint，纯 SQL 聚合）。"""
+    db = chat_db_path()
+    if not db.exists():
+        return 0
+    try:
+        # mode=ro 只读打开：避免与正在写入的 REPL 进程争锁，也防止误写
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        try:
+            # checkpoints 表每轮一行，DISTINCT 得到会话总数
+            row = con.execute(
+                "SELECT COUNT(DISTINCT thread_id) FROM checkpoints"
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            con.close()
+    except sqlite3.Error:
+        # 库损坏/表不存在等：视为无会话，不阻断上层列表展示
+        return 0
+
+
+def _recent_thread_ids(limit: int, offset: int) -> List[str]:
+    """按「最近更新时间」倒序取第 offset..offset+limit 个会话 id（纯 SQL，不反序列化）。
+
+    排序依据 = 每个 thread_id 的最大 checkpoint_id。它是 uuid7 单调串，字典序即
+    时间序，故 MAX(...) DESC 与按 checkpoint.ts 倒序一致（实测 42/42 相同）；
+    而 MAX() 走 (thread_id, checkpoint_ns, checkpoint_id) 主键索引，GROUP BY 无需
+    碰 checkpoint BLOB —— 这是「会话上万也不慢」的关键（不再反序列化全部快照）。
+
+    不按 checkpoint_ns 过滤：与旧实现 SELECT DISTINCT thread_id 口径一致（父图与
+    子图命名空间各行同 thread_id，行序无关紧要，取 MAX 即最新更新时刻）。
+    """
     db = chat_db_path()
     if not db.exists():
         return []
     ids: List[str] = []
     try:
         # mode=ro 只读打开：避免与正在写入的 REPL 进程争锁，也防止误写
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
         try:
-            # checkpoints 表每轮一行，DISTINCT 得到全部会话 id
-            for row in con.execute("SELECT DISTINCT thread_id FROM checkpoints"):
-                if row[0] not in ids:  # 去重保序（SQL 不保证 DISTINCT 顺序）
-                    ids.append(row[0])
+            for row in con.execute(
+                "SELECT thread_id, MAX(checkpoint_id) FROM checkpoints "
+                "GROUP BY thread_id ORDER BY 2 DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ):
+                ids.append(row[0])
         finally:
             con.close()
     except sqlite3.Error:
@@ -118,57 +165,110 @@ def _all_thread_ids() -> List[str]:
     return ids
 
 
-def list_sessions() -> List[dict]:
-    """列出所有会话概览（按最近更新倒序）。
+def _page_tuples(saver: SqliteSaver, thread_ids: List[str]) -> List[Any]:
+    """批量取每个会话的「最新 checkpoint」，用 get_tuple 走主键单行查询。
 
-    返回 [{thread_id, updated_at, turns, first_question, chars}]；
-    库不存在/无会话时返回空表。
+    会话清单已由 _recent_thread_ids 在 SQL 层分页，这里每页只处理有界的
+    thread_id 数，用 SqliteSaver.get_tuple（省略 checkpoint_id 时即
+    ORDER BY checkpoint_id DESC LIMIT 1）取代旧的「遍历该会话全部 checkpoint
+    取 ts 最大」。两者逐项等价（实测 42/42 ts+id 相同），但前者不反序列化历史
+    快照，单会话 0.085s → 0.007s。
+
+    list(limit=1) 作兜底：它不按 checkpoint_ns 过滤，返回行与 get_tuple() 同序
+    取首条；get_tuple 缺失时才启用，避免拖慢主路径。
     """
+    out: List[Any] = []
+    for tid in thread_ids:
+        # 字典字面量必须内联传参：pyright 会按 RunnableConfig 形参做上下文推断，
+        # 先赋给变量会被推断成 dict[str, dict[str, str]] 而报类型错
+        cp = saver.get_tuple({"configurable": {"thread_id": tid}})
+        if cp is None:  # 极端情况（如只有命名空间子图中间态）兜底，与 get_tuple 同序
+            cp = next(
+                iter(saver.list({"configurable": {"thread_id": tid}}, limit=1)), None
+            )
+        if cp is not None:  # 只有中间态、无完整 checkpoint 的 thread 跳过
+            out.append(cp)
+    return out
+
+
+def _session_rows(cps: List[Any]) -> List[dict]:
+    """把最新 checkpoint 们整理成会话概览行。"""
     out: List[dict] = []
-    if not chat_db_path().exists():
-        return out
-    with open_saver() as saver:
-        for tid in _all_thread_ids():
-            cp = _latest_tuple(saver, tid)
-            if cp is None:  # 该 thread 只有中间态、无完整 checkpoint，跳过
-                continue
-            # channel_values 是图状态快照：messages 为累积消息列表，
-            # history_summary 为 manage_context 截断后写入的摘要
-            values = (cp.checkpoint or {}).get("channel_values", {}) or {}
-            msgs = list(values.get("messages", []) or [])
-            first = ""
-            # 首条 HumanMessage 作为会话标题（跳过 System/AI 消息）
-            for m in msgs:
-                if isinstance(m, HumanMessage):
-                    first = _msg_text(m).strip().replace("\n", " ")
-                    break
-            out.append({
-                "thread_id": tid,
+    for cp in cps:
+        # channel_values 是图状态快照：messages 为累积消息列表，
+        # history_summary 为 manage_context 截断后写入的摘要
+        values = (cp.checkpoint or {}).get("channel_values", {}) or {}
+        msgs = list(values.get("messages", []) or [])
+        first = ""
+        # 首条 HumanMessage 作为会话标题（跳过 System/AI 消息）
+        for m in msgs:
+            if isinstance(m, HumanMessage):
+                first = _msg_text(m).strip().replace("\n", " ")
+                break
+        out.append(
+            {
+                "thread_id": cp.config["configurable"]["thread_id"],
                 "updated_at": (cp.checkpoint or {}).get("ts", ""),
                 # 轮数 = 学生提问次数（一次提问对应一轮）
                 "turns": sum(1 for m in msgs if isinstance(m, HumanMessage)),
                 "first_question": first[:60],  # 截断，避免列表行过长
                 "chars": sum(len(_msg_text(m)) for m in msgs),  # 会话体量参考
-            })
-    # 最近更新的排前面（ts 为 ISO 串，倒序即时间倒序）
-    out.sort(key=lambda x: x["updated_at"], reverse=True)
+            }
+        )
     return out
 
 
-def session_snapshot(saver: SqliteSaver, thread_id: str
-                     ) -> Tuple[str, List[AnyMessage]]:
+def list_sessions(
+    limit: Optional[int] = None, offset: int = 0
+) -> Tuple[List[dict], int]:
+    """列出会话概览，分页返回 ``(当前页行, 会话总数)``（按最近更新倒序）。
+
+    行结构 [{thread_id, updated_at, turns, first_question, chars}]；
+    库不存在/无会话时返回 ``([], 0)``。
+
+    会话数量日积月累后，全量返回会随会话数线性变慢（每会话反序列化一次最新
+    checkpoint）。分页在 **SQL 层** 完成排序与切片：只有当前页的会话会被反序列化，
+    因此请求耗时与「总会话数」解耦，只与 ``limit`` 相关。
+
+    - ``limit=None``：返回全部（CLI ``--list`` 的兼容行为，仍按页内查询实现）；
+    - ``offset``：跳过前 N 条用于翻页；越界返回空表但 ``total`` 仍为真实总数。
+
+    返回行按 ``updated_at`` 倒序，且与旧全量实现**逐项一致**（同序：SQL 按
+    MAX(checkpoint_id) 倒序 == 按 ts 倒序，实测相同）。
+    """
+    total = _count_threads()
+    if total == 0:
+        return [], 0
+    page_limit = total if limit is None else max(int(limit), 0)
+    page_offset = max(int(offset), 0)
+    if page_limit == 0:  # 显式 limit=0：只回总数不回行
+        return [], total
+    ids = _recent_thread_ids(page_limit, page_offset)
+    if not ids:
+        return [], total
+    with open_saver() as saver:
+        rows = _session_rows(_page_tuples(saver, ids))
+    # 最近更新的排前面（ts 为 ISO 串，倒序即时间倒序）
+    rows.sort(key=lambda x: x["updated_at"], reverse=True)
+    return rows, total
+
+
+def session_snapshot(
+    saver: SqliteSaver, thread_id: str
+) -> Tuple[str, List[AnyMessage]]:
     """返回 (history_summary, messages) 最新快照；无会话返回 ("", [])。"""
     cp = _latest_tuple(saver, thread_id)
     if cp is None:
         return "", []
     values = (cp.checkpoint or {}).get("channel_values", {}) or {}
     # history_summary 可能为 None（未触发截断），统一成空串
-    return ((values.get("history_summary") or ""),
-            list(values.get("messages", []) or []))
+    return (
+        (values.get("history_summary") or ""),
+        list(values.get("messages", []) or []),
+    )
 
 
-def export_session_md(thread_id: str,
-                      out_dir: Optional[Path] = None) -> Optional[Path]:
+def export_session_md(thread_id: str, out_dir: Optional[Path] = None) -> Optional[Path]:
     """把整段会话导出为 Markdown（/export、--export 用），返回文件路径。
 
     无该会话时返回 None。回答正文做公式定界符兜底归一化（同 main 保存 md
@@ -187,15 +287,21 @@ def export_session_md(thread_id: str,
     path = out_dir / f"session_{safe_tid}_{now:%Y%m%d_%H%M%S}.md"
     # 文件头：导出元信息，便于归档后辨认来源会话
     lines = [
-        "# 学习会话记录", "",
+        "# 学习会话记录",
+        "",
         f"- 导出时间：{now:%Y-%m-%d %H:%M:%S}",
         f"- 会话 ID：{thread_id}",
-        f"- 对话轮数：{sum(1 for m in msgs if isinstance(m, HumanMessage))}", "",
+        f"- 对话轮数：{sum(1 for m in msgs if isinstance(m, HumanMessage))}",
+        "",
     ]
     if summary:
         # 被截断的更早对话只剩摘要，放在正文前说明，避免读者误以为会话不完整
-        lines += ["## 更早对话摘要（超上下文预算被截断前自动压缩）", "",
-                  summary.strip(), ""]
+        lines += [
+            "## 更早对话摘要（超上下文预算被截断前自动压缩）",
+            "",
+            summary.strip(),
+            "",
+        ]
     # 按 Human 提问 + 其后 AI 回答成组；末尾悬空提问单列
     pairs: List[Tuple[str, str]] = []
     cur_q = ""

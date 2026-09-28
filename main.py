@@ -70,8 +70,7 @@ from ingestion import (
     normalize_subject,
 )
 from logger import get_logger
-from pdf_processor import (_load_cached_pages, _pdf_id,
-                           extract_pdf_pages_as_markdown)
+from pdf_processor import _load_cached_pages, _pdf_id, extract_pdf_pages_as_markdown
 from storage.graph_analysis import analyze_graph
 from storage.graph_store import K_PDF_SOURCE, K_SUBJECT, ScienceGraphStore
 from storage.image_store import relativize_image_paths
@@ -106,72 +105,159 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--stage", choices=("all", "build", "ask", "chat", "serve", "analyze"),
+        "--stage",
+        choices=("all", "build", "ask", "chat", "serve", "analyze"),
         default="all",
         help="all=提取+建库+问答；build=仅提取并累加进双库；ask=仅复用已持久化双库问答；"
-             "chat=多轮对话（会话历史持久化，可 --session 续聊）；"
-             "serve=启动 FastAPI HTTP 服务（books/ask/chat/build 接口 + SSE 流式）；"
-             "analyze=对已持久化图谱做结构分析（健康度审计+中心性/社区，写回 "
-             "importance/community 属性），不触碰向量库、不调用任何模型。",
+        "chat=多轮对话（会话历史持久化，可 --session 续聊）；"
+        "serve=启动 FastAPI HTTP 服务（books/ask/chat/build 接口 + SSE 流式）；"
+        "analyze=对已持久化图谱做结构分析（健康度审计+中心性/社区，写回 "
+        "importance/community 属性），不触碰向量库、不调用任何模型。",
     )
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="serve：HTTP 监听地址（对外提供服务用 0.0.0.0）。")
-    parser.add_argument("--port", type=int, default=6173,
-                        help="serve：HTTP 监听端口。")
-    parser.add_argument("--reload", action="store_true",
-                        help="serve：开发模式热重载（改代码自动重启，勿用于生产）。")
-    parser.add_argument("--pdf", default=DEFAULT_PDF, help="教材 PDF 路径（build/all 阶段使用）。")
-    parser.add_argument("--book", default=None, metavar="教材名",
-                        help="该 PDF 的教材显示名（如「质心灵动量教育讲义」），用于答案里"
-                             "「收录于《教材名》」来源标注；缺省取 PDF 文件名（去扩展名）。"
-                             "重复登记同一 --pdf 即改名覆盖。")
-    parser.add_argument("--book-id", dest="book_id", default=None, metavar="逻辑书ID",
-                        help="该 PDF 所属「逻辑书」的 id（同名多版本靠它聚合成一本）。"""
-                             "缺省由 --book 派生：书名相同即同一本。改版后 PDF 内容变了"
-                             "（pdf_id 是内容哈希）但书名没变时，展示层仍会折叠为「N 个版本」；"
-                             "若书名也变了、却确实是同一本，才需显式传本参数合并。")
-    parser.add_argument("--start-page", type=int, default=DEFAULT_START_PAGE,
-                        help="起始页码（从 1 计）。")
-    parser.add_argument("--end-page", type=int, default=DEFAULT_END_PAGE,
-                        help="结束页码（含），超出总页数自动截断。")
-    parser.add_argument("--subject", type=_subject_choice, default=None,
-                        choices=("physics", "chemistry", "math"),
-                        help="学科，仅限三种：physics/物理、chemistry/化学、math/数学"
-                             "（接受中文或拼音别名，自动归一化）。build/ask 缺省为"
-                             " physics；analyze 缺省为图谱内全部学科。")
-    parser.add_argument("--query", default=DEFAULT_QUERY,
-                        help="学生提问（ask/all 阶段使用）。")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="serve：HTTP 监听地址（对外提供服务用 0.0.0.0）。",
+    )
+    parser.add_argument("--port", type=int, default=6173, help="serve：HTTP 监听端口。")
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="serve：开发模式热重载（改代码自动重启，勿用于生产）。",
+    )
+    parser.add_argument(
+        "--pdf", default=DEFAULT_PDF, help="教材 PDF 路径（build/all 阶段使用）。"
+    )
+    parser.add_argument(
+        "--book",
+        default=None,
+        metavar="教材名",
+        help="该 PDF 的教材显示名（如「质心灵动量教育讲义」），用于答案里"
+        "「收录于《教材名》」来源标注；缺省取 PDF 文件名（去扩展名）。"
+        "重复登记同一 --pdf 即改名覆盖。",
+    )
+    parser.add_argument(
+        "--book-id",
+        dest="book_id",
+        default=None,
+        metavar="逻辑书ID",
+        help="该 PDF 所属「逻辑书」的 id（同名多版本靠它聚合成一本）。"
+        ""
+        "缺省由 --book 派生：书名相同即同一本。改版后 PDF 内容变了"
+        "（pdf_id 是内容哈希）但书名没变时，展示层仍会折叠为「N 个版本」；"
+        "若书名也变了、却确实是同一本，才需显式传本参数合并。",
+    )
+    parser.add_argument(
+        "--start-page",
+        type=int,
+        default=DEFAULT_START_PAGE,
+        help="起始页码（从 1 计）。",
+    )
+    parser.add_argument(
+        "--end-page",
+        type=int,
+        default=DEFAULT_END_PAGE,
+        help="结束页码（含），超出总页数自动截断。",
+    )
+    parser.add_argument(
+        "--subject",
+        type=_subject_choice,
+        default=None,
+        choices=("physics", "chemistry", "math"),
+        help="学科，仅限三种：physics/物理、chemistry/化学、math/数学"
+        "（接受中文或拼音别名，自动归一化）。build/ask 缺省为"
+        " physics；analyze 缺省为图谱内全部学科。",
+    )
+    parser.add_argument(
+        "--query", default=DEFAULT_QUERY, help="学生提问（ask/all 阶段使用）。"
+    )
     # ---- chat 模式专属参数 ----
-    parser.add_argument("--session", default=None, metavar="ID",
-                        help="chat：进入/续聊指定会话（thread_id，见 --list）；缺省新建会话。")
-    parser.add_argument("--list", dest="chat_list", action="store_true",
-                        help="chat：列出既有会话清单后退出（不进入对话）。")
-    parser.add_argument("--export", dest="chat_export", default=None, metavar="ID",
-                        help="chat：把指定会话导出为 Markdown 后退出（不进入对话）。")
-    parser.add_argument("--list-books", dest="list_books", action="store_true",
-                        help="列出已导入双库的教材书名后退出（不执行任何阶段；"
-                             "同名多版本折叠成一本显示）。")
-    parser.add_argument("--all-versions", dest="all_versions", action="store_true",
-                        help="配合 --list-books：把每个逻辑书的全部版本号逐行展开。")
-    parser.add_argument("--set-active-version", dest="set_active_version", default=None,
-                        metavar="PDF_ID",
-                        help="把该 pdf_id 标记为其所属逻辑书的当前版本后退出。只改"
-                             "登记表属性（is_active），不增删任何图谱/向量数据，可反复切换；"
-                             "版本号用 --list-books --all-versions 查。")
-    parser.add_argument("--max-chars", type=int, default=_CHUNK_MAX_CHARS_DEFAULT,
-                        help="知识抽取单子块字符预算（build/all）：输入页超过预算即自动"
-                             "切块增量抽取，避免整本书一次喂给推理 LLM 超上下文。")
-    parser.add_argument("--max-chunks", type=int, default=None, metavar="N",
-                        help="本次建库最多处理 N 个未命中缓存的新子块（缓存命中不占额度），"
-                             "达到即主动停，已完成子块已落盘/缓存，重跑同命令续跑。")
-    parser.add_argument("--save-every-chunks", type=int, default=10, metavar="N",
-                        help="每处理 N 个抽取子块保存一次图谱快照，末尾仍会保存（默认 10）。")
-    parser.add_argument("--max-new-calls", type=int, default=None, metavar="N",
-                        help="本次视觉提取最多新调用 N 次（已缓存页不占额度），达到即主动停；"
-                             "已完成页已逐页缓存，重跑同命令续跑（控视觉模型成本，"
-                             "与 --max-chunks 同套分批消费模式）。")
-    parser.add_argument("--yes", action="store_true",
-                        help="跳过建库前的规模预估确认（脚本/夜间批量自动放行）。")
+    parser.add_argument(
+        "--session",
+        default=None,
+        metavar="ID",
+        help="chat：进入/续聊指定会话（thread_id，见 --list）；缺省新建会话。",
+    )
+    parser.add_argument(
+        "--list",
+        dest="chat_list",
+        action="store_true",
+        help="chat：列出既有会话清单后退出（不进入对话）。",
+    )
+    parser.add_argument(
+        "--list-limit",
+        dest="chat_list_limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="配合 --list/HTTP GET /chat/sessions：只列最近 N 条"
+        "（缺省列全部，N<=0 视为不限制）。",
+    )
+    parser.add_argument(
+        "--export",
+        dest="chat_export",
+        default=None,
+        metavar="ID",
+        help="chat：把指定会话导出为 Markdown 后退出（不进入对话）。",
+    )
+    parser.add_argument(
+        "--list-books",
+        dest="list_books",
+        action="store_true",
+        help="列出已导入双库的教材书名后退出（不执行任何阶段；"
+        "同名多版本折叠成一本显示）。",
+    )
+    parser.add_argument(
+        "--all-versions",
+        dest="all_versions",
+        action="store_true",
+        help="配合 --list-books：把每个逻辑书的全部版本号逐行展开。",
+    )
+    parser.add_argument(
+        "--set-active-version",
+        dest="set_active_version",
+        default=None,
+        metavar="PDF_ID",
+        help="把该 pdf_id 标记为其所属逻辑书的当前版本后退出。只改"
+        "登记表属性（is_active），不增删任何图谱/向量数据，可反复切换；"
+        "版本号用 --list-books --all-versions 查。",
+    )
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=_CHUNK_MAX_CHARS_DEFAULT,
+        help="知识抽取单子块字符预算（build/all）：输入页超过预算即自动"
+        "切块增量抽取，避免整本书一次喂给推理 LLM 超上下文。",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=None,
+        metavar="N",
+        help="本次建库最多处理 N 个未命中缓存的新子块（缓存命中不占额度），"
+        "达到即主动停，已完成子块已落盘/缓存，重跑同命令续跑。",
+    )
+    parser.add_argument(
+        "--save-every-chunks",
+        type=int,
+        default=10,
+        metavar="N",
+        help="每处理 N 个抽取子块保存一次图谱快照，末尾仍会保存（默认 10）。",
+    )
+    parser.add_argument(
+        "--max-new-calls",
+        type=int,
+        default=None,
+        metavar="N",
+        help="本次视觉提取最多新调用 N 次（已缓存页不占额度），达到即主动停；"
+        "已完成页已逐页缓存，重跑同命令续跑（控视觉模型成本，"
+        "与 --max-chunks 同套分批消费模式）。",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过建库前的规模预估确认（脚本/夜间批量自动放行）。",
+    )
     return parser.parse_args()
 
 
@@ -183,10 +269,18 @@ def _normalize_math_delims(text: str) -> str:
     而块级 $$ ... $$ 与行内 $ ... $ 在 VS Code 预览 / GitHub / Typora /
     Obsidian 等常见阅读器中均能渲染。本函数对模型输出做兜底归一化。
     """
-    text = re.sub(r"\\\[\s*(.*?)\s*\\\]",
-                  lambda m: "$$\n" + m.group(1).strip() + "\n$$", text, flags=re.S)
-    text = re.sub(r"\\\(\s*(.*?)\s*\\\)",
-                  lambda m: "$" + m.group(1).strip() + "$", text, flags=re.S)
+    text = re.sub(
+        r"\\\[\s*(.*?)\s*\\\]",
+        lambda m: "$$\n" + m.group(1).strip() + "\n$$",
+        text,
+        flags=re.S,
+    )
+    text = re.sub(
+        r"\\\(\s*(.*?)\s*\\\)",
+        lambda m: "$" + m.group(1).strip() + "$",
+        text,
+        flags=re.S,
+    )
     return text
 
 
@@ -212,8 +306,15 @@ def _save_answer_markdown(result: dict, fallback_subject: str) -> Path:
     if concept:
         lines.append(f"- 知识锚点：{concept}")
     lines += [
-        "", "## 提问", "", result.get("query", ""),
-        "", "## 讲解", "", result.get("final_answer", ""), "",
+        "",
+        "## 提问",
+        "",
+        result.get("query", ""),
+        "",
+        "## 讲解",
+        "",
+        result.get("final_answer", ""),
+        "",
     ]
     # 回答里的「教材原图」路径以项目根为基准书写（见 storage/image_store），
     # 这里按本文件实际位置换算成相对路径——Markdown 阅读器按 md 所在目录解析
@@ -225,8 +326,11 @@ def _save_answer_markdown(result: dict, fallback_subject: str) -> Path:
 # ---- chat 多轮会话模式 -----------------------------------------------------
 # messages 流按节点过滤：只上屏生成节点（讲解/搜题/闲聊）的正文 token；
 # 意图判定等短 LLM 调用的输出是内部中间件，不上屏。
-_CHAT_STREAM_NODES = ("generate_response", "generate_problem_response",
-                      "respond_chitchat")
+_CHAT_STREAM_NODES = (
+    "generate_response",
+    "generate_problem_response",
+    "respond_chitchat",
+)
 
 
 def _new_thread_id() -> str:
@@ -234,17 +338,32 @@ def _new_thread_id() -> str:
     return "s-" + uuid.uuid4().hex[:12]
 
 
-def _print_sessions() -> None:
-    """--list：打印既有会话清单。"""
-    sessions = list_sessions()
+def _print_sessions(limit: Optional[int] = None) -> None:
+    """--list：打印既有会话清单（分页，按最近更新倒序）。
+
+    limit 缺省打印全部（CLI 交互式翻找的既有行为）；传 N 只打印最近 N 条，
+    适合会话上千时快速看最新几条（见 --list-limit）。
+    """
+    sessions, total = list_sessions(limit=limit)
     if not sessions:
         log.info("[chat] 暂无历史会话（首次对话会自动创建新会话）")
         return
-    log.info("[chat] 历史会话（共 %d 个，按最近更新倒序）:", len(sessions))
+    if limit is not None and len(sessions) < total:
+        log.info(
+            "[chat] 历史会话（最近 %d / 共 %d 个，按最近更新倒序）:",
+            len(sessions),
+            total,
+        )
+    else:
+        log.info("[chat] 历史会话（共 %d 个，按最近更新倒序）:", len(sessions))
     for s in sessions:
-        log.info("  %s | 更新 %s | %d 轮 | %s",
-                 s["thread_id"], s["updated_at"][:19].replace("T", " "),
-                 s["turns"], s["first_question"] or "（无文字提问）")
+        log.info(
+            "  %s | 更新 %s | %d 轮 | %s",
+            s["thread_id"],
+            s["updated_at"][:19].replace("T", " "),
+            s["turns"],
+            s["first_question"] or "（无文字提问）",
+        )
 
 
 def _print_books(*, all_versions: bool = False) -> None:
@@ -263,16 +382,22 @@ def _print_books(*, all_versions: bool = False) -> None:
         log.info("[main] 暂无已导入教材（build 阶段建库时自动登记）")
         return
     ordered = sorted(books.values(), key=lambda b: (b["name"], b["logical_book_id"]))
-    log.info("[main] 已导入教材（共 %d 本 / %d 个版本）:",
-             len(ordered), sum(b["version_count"] for b in ordered))
+    log.info(
+        "[main] 已导入教材（共 %d 本 / %d 个版本）:",
+        len(ordered),
+        sum(b["version_count"] for b in ordered),
+    )
     for b in ordered:
         name = b["name"] or "（未命名）"
         if b["version_count"] == 1:
             log.info("  《%s》 (%s)", name, b["versions"][0]["pdf_id"])
             continue
         active = b["active_pdf_id"]
-        state = (f"当前 {active}" if active
-                 else "未指定当前版本，用 --set-active-version 指定")
+        state = (
+            f"当前 {active}"
+            if active
+            else "未指定当前版本，用 --set-active-version 指定"
+        )
         log.info("  《%s》 (%d 个版本, %s)", name, b["version_count"], state)
         if all_versions:
             for v in b["versions"]:
@@ -289,14 +414,19 @@ def _set_active_version(pdf_id: str) -> None:
     store = ScienceGraphStore.load()
     names = store.pdf_names()
     if pdf_id not in names:
-        log.error("[main] 未登记的 pdf_id: %s（用 --list-books --all-versions 查看）",
-                  pdf_id)
+        log.error(
+            "[main] 未登记的 pdf_id: %s（用 --list-books --all-versions 查看）", pdf_id
+        )
         return
     book_id = store.set_active_version(pdf_id)
     store.save()
     book = store.logical_books().get(book_id or "", {})
-    log.info("[main] 已把《%s》的当前版本设为 %s（共 %d 个版本）",
-             names.get(pdf_id) or "（未命名）", pdf_id, book.get("version_count", 1))
+    log.info(
+        "[main] 已把《%s》的当前版本设为 %s（共 %d 个版本）",
+        names.get(pdf_id) or "（未命名）",
+        pdf_id,
+        book.get("version_count", 1),
+    )
 
 
 def _run_analyze(args: argparse.Namespace) -> None:
@@ -313,16 +443,23 @@ def _run_analyze(args: argparse.Namespace) -> None:
     subjects = [args.subject]
     if not args.subject:
         subjects = sorted(
-            {str(nd["subject"]) for _nid, nd in graph_db.graph.nodes(data=True)
-             if nd.get("subject") and nd["subject"] != "meta"
-             and nd.get("type") not in (K_SUBJECT, K_PDF_SOURCE)})
+            {
+                str(nd["subject"])
+                for _nid, nd in graph_db.graph.nodes(data=True)
+                if nd.get("subject")
+                and nd["subject"] != "meta"
+                and nd.get("type") not in (K_SUBJECT, K_PDF_SOURCE)
+            }
+        )
     if not subjects:
         log.warning("[main] 图谱中未发现任何学科实体，无可分析内容")
         return
     for subj in subjects:
         analyze_graph(graph_db, subj, save=True)
-    log.info("[main] 结构分析完成（学科: %s），importance/community 属性已持久化",
-             ", ".join(subjects))
+    log.info(
+        "[main] 结构分析完成（学科: %s），importance/community 属性已持久化",
+        ", ".join(subjects),
+    )
 
 
 def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> None:
@@ -336,7 +473,11 @@ def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> No
         _, history = session_snapshot(saver, sid)
         if history:
             turns = sum(1 for m in history if isinstance(m, HumanMessage))
-            log.info("[chat] 续聊会话 %s（已载入 %d 轮历史，输入 /new 可开新会话）", sid, turns)
+            log.info(
+                "[chat] 续聊会话 %s（已载入 %d 轮历史，输入 /new 可开新会话）",
+                sid,
+                turns,
+            )
         else:
             log.warning("[chat] 会话 %s 不存在或为空，改用新会话", sid)
             sid = None
@@ -372,8 +513,10 @@ def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> No
             _print_sessions()
             continue
         if low == "/help":
-            print("命令: /exit 退出 | /new 新会话 | /export 导出当前会话为 md |\n"
-                  "      /session <id> 切到指定会话续聊 | /list 列会话 | /help 帮助")
+            print(
+                "命令: /exit 退出 | /new 新会话 | /export 导出当前会话为 md |\n"
+                "      /session <id> 切到指定会话续聊 | /list 列会话 | /help 帮助"
+            )
             continue
         if low.startswith("/session"):
             parts = line.split()
@@ -407,7 +550,9 @@ def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> No
             # 思考模式下的 reasoning_content 增量先以 [思考] 区块上屏，
             # 正文首块到达时切回 [回答]，便于观察模型在想什么、卡在哪。
             for mode, chunk in agent.stream(
-                inputs, config=config, stream_mode=["messages", "values"],
+                inputs,
+                config=config,
+                stream_mode=["messages", "values"],
             ):
                 if mode == "messages":
                     msg, meta = chunk
@@ -421,12 +566,12 @@ def _run_chat_repl(saver: Any, agent: Any, initial_session: Optional[str]) -> No
                             print("[思考] ", end="", flush=True)
                         print(reasoning, end="", flush=True)
                         continue
-                    text = (msg.content if isinstance(msg.content, str) else "")
+                    text = msg.content if isinstance(msg.content, str) else ""
                     if text and len(text) > len(printed) and text.startswith(printed):
                         if in_thinking:
                             in_thinking = False
                             print("\n\n[回答] ", end="", flush=True)
-                        print(text[len(printed):], end="", flush=True)
+                        print(text[len(printed) :], end="", flush=True)
                         printed = text
                 else:
                     result = chunk
@@ -465,8 +610,9 @@ class TokenMeter:
             prompt = um.get("input_tokens") or 0
             completion = um.get("output_tokens") or 0
         else:
-            usage = ((getattr(response, "response_metadata", None) or {})
-                     .get("token_usage") or {})
+            usage = (getattr(response, "response_metadata", None) or {}).get(
+                "token_usage"
+            ) or {}
             prompt = usage.get("prompt_tokens") or 0
             completion = usage.get("completion_tokens") or 0
         if not prompt and not completion:
@@ -477,8 +623,13 @@ class TokenMeter:
 
     def report(self, label: str) -> None:
         if self.calls:
-            log.info("[cost] %s 实际消耗：%d 次调用，输入 %d / 输出 %d tokens",
-                     label, self.calls, self.prompt_tokens, self.completion_tokens)
+            log.info(
+                "[cost] %s 实际消耗：%d 次调用，输入 %d / 输出 %d tokens",
+                label,
+                self.calls,
+                self.prompt_tokens,
+                self.completion_tokens,
+            )
         else:
             log.info("[cost] %s：无实际模型调用（全部命中缓存）", label)
 
@@ -487,9 +638,14 @@ class TokenMeter:
 _ESTIMATE_UNKNOWN_PAGE_CHARS = 2000
 
 
-def _estimate_build(pdf_path: str, start_page: int, end_page: int,
-                    subject: str, max_chars: int,
-                    max_vision_calls: Optional[int] = None) -> dict:
+def _estimate_build(
+    pdf_path: str,
+    start_page: int,
+    end_page: int,
+    subject: str,
+    max_chars: int,
+    max_vision_calls: Optional[int] = None,
+) -> dict:
     """建库规模预估（干跑）：只读逐页缓存 + 按预算预演切块，不调用任何模型。
 
     max_vision_calls：视觉提取侧分批上限（对应 extract_pdf_pages_as_markdown
@@ -537,7 +693,9 @@ def _estimate_build(pdf_path: str, start_page: int, end_page: int,
     cached_pages = sum(1 for p in processed if p in cached)
 
     lengths = [len(cached[p]) for p in processed if p in cached]
-    est_len = round(sum(lengths) / len(lengths)) if lengths else _ESTIMATE_UNKNOWN_PAGE_CHARS
+    est_len = (
+        round(sum(lengths) / len(lengths)) if lengths else _ESTIMATE_UNKNOWN_PAGE_CHARS
+    )
     # 未缓存页用无标题占位文本（长度≈均值）预演切块：与真实运行共用同一套
     # _split_into_chunks，保证边界规则一致（仅内容未知导致的偏差不可避免）。
     synth = [
@@ -551,7 +709,10 @@ def _estimate_build(pdf_path: str, start_page: int, end_page: int,
         pages = [c["page"] for c in chunk]
         if all(pg in cached for pg in pages):  # 仅整块已缓存时缓存 key 才可精确判定
             real = [{"page": pg, "content": cached[pg]} for pg in pages]
-            if _load_extract_cache(_cache_key(subject, _chunk_markdown(real))) is not None:
+            if (
+                _load_extract_cache(_cache_key(subject, _chunk_markdown(real)))
+                is not None
+            ):
                 cached_chunks += 1
     new_chunks = len(plan) - cached_chunks
     return {
@@ -573,21 +734,38 @@ def _print_estimate(est: dict, max_chars: int) -> None:
     log.info("[main] 本次任务规模预估（只读缓存 + 本地统计，未调用任何模型）:")
     if est["vision_capped"]:
         # 视觉侧被 --max-new-calls 截断：明确告诉用户本批处理量与剩余待续跑页数
-        log.info("  页码范围共 %d 页，本次视觉提取 %d 页（新调用 %d + 已缓存 %d），"
-                 "剩余 %d 页留待下次续跑",
-                 est["range_pages"], est["processed_pages"], est["new_vision_calls"],
-                 est["cached_pages"], est["skipped_pages"])
+        log.info(
+            "  页码范围共 %d 页，本次视觉提取 %d 页（新调用 %d + 已缓存 %d），"
+            "剩余 %d 页留待下次续跑",
+            est["range_pages"],
+            est["processed_pages"],
+            est["new_vision_calls"],
+            est["cached_pages"],
+            est["skipped_pages"],
+        )
     else:
-        log.info("  页码范围共 %d 页 | 视觉提取：已缓存 %d 页，需新调用 %d 次",
-                 est["range_pages"], est["cached_pages"], est["new_vision_calls"])
-    log.info("  知识抽取：按 --max-chars=%d 自动切 %d 个子块，"
-             "已缓存 %d 个，需新抽取 %d 个（约 %d 次推理 LLM 调用）",
-             max_chars, est["plan_chunks"], est["cached_chunks"],
-             est["new_chunks"], est["new_chunks"] * 2)
+        log.info(
+            "  页码范围共 %d 页 | 视觉提取：已缓存 %d 页，需新调用 %d 次",
+            est["range_pages"],
+            est["cached_pages"],
+            est["new_vision_calls"],
+        )
+    log.info(
+        "  知识抽取：按 --max-chars=%d 自动切 %d 个子块，"
+        "已缓存 %d 个，需新抽取 %d 个（约 %d 次推理 LLM 调用）",
+        max_chars,
+        est["plan_chunks"],
+        est["cached_chunks"],
+        est["new_chunks"],
+        est["new_chunks"] * 2,
+    )
     if est["new_vision_calls"]:
-        log.info("  （含本批未提取页 %d 页：内容未知，切块按平均页长 %d 字预演，"
-                 "实际块数可能略有出入；真实 token 消耗以结束时统计为准）",
-                 est["new_vision_calls"], est["approx_len"])
+        log.info(
+            "  （含本批未提取页 %d 页：内容未知，切块按平均页长 %d 字预演，"
+            "实际块数可能略有出入；真实 token 消耗以结束时统计为准）",
+            est["new_vision_calls"],
+            est["approx_len"],
+        )
 
 
 def _confirm_build(est: dict, yes: bool) -> bool:
@@ -600,9 +778,12 @@ def _confirm_build(est: dict, yes: bool) -> bool:
         log.info("[main] --yes：跳过确认直接执行（预估 %d 次新调用）", new_calls)
         return True
     if not sys.stdin.isatty():
-        log.error("[main] 本次将产生约 %d 次新模型调用，且当前不是交互终端；"
-                  "请确认规模后加 --yes 重新执行，或先用 --start-page/--end-page/"
-                  "--max-chunks/--max-new-calls 缩小本次范围", new_calls)
+        log.error(
+            "[main] 本次将产生约 %d 次新模型调用，且当前不是交互终端；"
+            "请确认规模后加 --yes 重新执行，或先用 --start-page/--end-page/"
+            "--max-chunks/--max-new-calls 缩小本次范围",
+            new_calls,
+        )
         return False
     try:
         answer = input("是否继续？[y/N] ").strip().lower()
@@ -617,8 +798,9 @@ def _report_meters(vision_meter: TokenMeter, reasoning_meter: TokenMeter) -> Non
     reasoning_meter.report("知识抽取")
     total_in = vision_meter.prompt_tokens + reasoning_meter.prompt_tokens
     total_out = vision_meter.completion_tokens + reasoning_meter.completion_tokens
-    log.info("[cost] 本次建库累计实际消耗：输入 %d / 输出 %d tokens",
-             total_in, total_out)
+    log.info(
+        "[cost] 本次建库累计实际消耗：输入 %d / 输出 %d tokens", total_in, total_out
+    )
 
 
 def main() -> None:
@@ -641,7 +823,7 @@ def main() -> None:
     if args.subject is None:
         args.subject = DEFAULT_SUBJECT
     if args.chat_list:
-        _print_sessions()
+        _print_sessions(args.chat_list_limit)
         return
     if args.chat_export is not None:
         path = export_session_md(args.chat_export)
@@ -655,37 +837,48 @@ def main() -> None:
     if args.stage == "serve":
         import uvicorn
 
-        log.info("[main] 启动 HTTP 服务：http://%s:%d  （文档 /docs）",
-                 args.host, args.port)
-        uvicorn.run("api.app:app", host=args.host, port=args.port,
-                    reload=args.reload)
+        log.info(
+            "[main] 启动 HTTP 服务：http://%s:%d  （文档 /docs）", args.host, args.port
+        )
+        uvicorn.run("api.app:app", host=args.host, port=args.port, reload=args.reload)
         return
 
     # 共享的双库实例：跨进程持久化，多学科教材可累积进同一份知识库
-    vector_db = get_vector_store()          # Chroma 本地持久化，自动加载历史切片
-    graph_db = ScienceGraphStore.load()     # 有历史图谱则加载，无则新建空库
+    vector_db = get_vector_store()  # Chroma 本地持久化，自动加载历史切片
+    graph_db = ScienceGraphStore.load()  # 有历史图谱则加载，无则新建空库
 
     # ---- chat 阶段：多轮对话 REPL（会话历史经 checkpointer 持久化） ----
     if args.stage == "chat":
         # SqliteSaver 纯同步后端：单连接包住整个 REPL（compile 传 checkpointer，
         # 每轮 stream 带 thread_id 即落盘，可随时 Ctrl+C / /exit 后 --session 续聊）
         with open_saver() as saver:
-            agent = create_circuit_agent(vector_db=vector_db, graph_db=graph_db,
-                                         checkpointer=saver)
+            agent = create_circuit_agent(
+                vector_db=vector_db, graph_db=graph_db, checkpointer=saver
+            )
             _run_chat_repl(saver, agent, args.session)
         log.info("[chat] 对话结束")
         return
 
     # ---- 建库阶段（all / build）：多模态提取 PDF 指定页 → 结构化抽取累积进双库
     if args.stage in ("all", "build"):
-        log.info("[main] 流水线启动, PDF=%s, 页码=%d-%d, subject=%s",
-                 args.pdf, args.start_page, args.end_page, args.subject)
+        log.info(
+            "[main] 流水线启动, PDF=%s, 页码=%d-%d, subject=%s",
+            args.pdf,
+            args.start_page,
+            args.end_page,
+            args.subject,
+        )
         # 花钱前先亮规模：只读逐页缓存 + 按预算预演切块（不调用任何模型）；
         # 全部命中缓存时自动放行，有新调用时交互确认（--yes 跳过）。
         # max_vision_calls 传入 --max-new-calls：预估/确认只亮本批真实会做的量。
-        est = _estimate_build(args.pdf, args.start_page, args.end_page,
-                              args.subject, args.max_chars,
-                              max_vision_calls=args.max_new_calls)
+        est = _estimate_build(
+            args.pdf,
+            args.start_page,
+            args.end_page,
+            args.subject,
+            args.max_chars,
+            max_vision_calls=args.max_new_calls,
+        )
         _print_estimate(est, args.max_chars)
         if not _confirm_build(est, args.yes):
             log.info("[main] 已取消本次建库（未调用任何模型）")
@@ -738,12 +931,15 @@ def main() -> None:
             # 取最后一份作为最终结果供保存。思考模式的 reasoning_content
             # 增量先以 [思考] 区块上屏，正文到达时切回正文输出。
             for mode, chunk in agent.stream(
-                {"query": args.query}, stream_mode=["messages", "values"],
+                {"query": args.query},
+                stream_mode=["messages", "values"],
             ):
                 if mode == "messages":
                     msg, meta = chunk
-                    if meta.get("langgraph_node") in ("generate_response",
-                                                      "generate_problem_response"):
+                    if meta.get("langgraph_node") in (
+                        "generate_response",
+                        "generate_problem_response",
+                    ):
                         ak = getattr(msg, "additional_kwargs", None) or {}
                         reasoning = ak.get("reasoning_content")
                         if isinstance(reasoning, str) and reasoning:
