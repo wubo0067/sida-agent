@@ -23,7 +23,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Generator, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -44,7 +44,7 @@ def chat_db_path() -> Path:
 
 
 @contextmanager
-def open_saver() -> Iterator[SqliteSaver]:
+def open_saver() -> Generator[SqliteSaver, None, None]:
     """打开 chat 检查点连接（生命周期内单连接，退出自动 close）。"""
     db = chat_db_path()
     # 首次运行 output/chat 可能不存在，先建目录再让 sqlite 建库文件
