@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     sida-agent 一键启动脚本（PowerShell 版）。
 
